@@ -13,6 +13,7 @@ let package = Package(
         .library(name: "Planner", targets: ["Planner"]),
         .library(name: "LLMRuntime", targets: ["LLMRuntime"]),
         .library(name: "ParserPipeline", targets: ["ParserPipeline"]),
+        .library(name: "Orchestration", targets: ["Orchestration"]),
         .library(name: "SlackIntegration", targets: ["SlackIntegration"]),
         .library(name: "GmailIntegration", targets: ["GmailIntegration"]),
         .library(name: "OutlookIntegration", targets: ["OutlookIntegration"]),
@@ -27,6 +28,16 @@ let package = Package(
         .target(name: "Planner", dependencies: ["CoreContracts"]),
         .target(name: "LLMRuntime", dependencies: ["CoreContracts"]),
         .target(name: "ParserPipeline", dependencies: ["CoreContracts"]),
+        .target(
+            name: "Orchestration",
+            dependencies: [
+                "CoreContracts",
+                "Planner",
+                "RulesEngine",
+                "SlackIntegration",
+                "EventKitAdapter"
+            ]
+        ),
         .target(
             name: "SlackIntegration",
             dependencies: ["CoreContracts"],
@@ -55,7 +66,10 @@ let package = Package(
                 "RulesEngine",
                 "Planner",
                 "LLMRuntime",
-                "ParserPipeline"
+                "ParserPipeline",
+                "Orchestration",
+                "EventKitAdapter",
+                "SlackIntegration"
             ]
         ),
         .executableTarget(
@@ -77,6 +91,14 @@ let package = Package(
         .testTarget(
             name: "StorageTests",
             dependencies: ["Storage", "CoreContracts"]
+        ),
+        .testTarget(
+            name: "OrchestrationTests",
+            dependencies: [
+                "Orchestration",
+                "CoreContracts",
+                "EventKitAdapter"
+            ]
         )
     ]
 )
