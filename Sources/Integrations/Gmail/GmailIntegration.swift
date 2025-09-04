@@ -34,10 +34,17 @@ public protocol GmailClient: Sendable {
 }
 
 public struct StubGmailClient: GmailClient {
-    public init() {}
+    private let pages: [(cursor: String?, messages: [GmailMessage], nextCursor: String?)]
+
+    public init(pages: [(cursor: String?, messages: [GmailMessage], nextCursor: String?)] = []) {
+        self.pages = pages
+    }
 
     public func fetchMessages(since cursor: String?) async throws -> ([GmailMessage], nextCursor: String?) {
-        _ = cursor
+        if let page = pages.first(where: { $0.cursor == cursor }) {
+            return (page.messages, page.nextCursor)
+        }
+
         return ([], cursor)
     }
 }

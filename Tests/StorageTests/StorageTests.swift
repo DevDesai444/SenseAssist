@@ -19,3 +19,26 @@ import Testing
     #expect(result.healthy)
     #expect(FileManager.default.fileExists(atPath: dbPath))
 }
+
+@Test func storageInitializeIsIdempotentAcrossRestarts() throws {
+    let tempDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let dbPath = tempDir.appendingPathComponent("senseassist.sqlite").path
+    let logger = ConsoleLogger(minimumLevel: .error)
+
+    do {
+        let firstStore = SQLiteStore(databasePath: dbPath, logger: logger)
+        try firstStore.initialize()
+        firstStore.close()
+    }
+
+    let secondStore = SQLiteStore(databasePath: dbPath, logger: logger)
+    try secondStore.initialize()
+    let healthy = try secondStore.healthCheck()
+    secondStore.close()
+
+    #expect(healthy)
+}
