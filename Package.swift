@@ -107,6 +107,10 @@ let package = Package(
             dependencies: ["Storage", "CoreContracts"]
         ),
         .testTarget(
+            name: "ParserPipelineTests",
+            dependencies: ["ParserPipeline", "CoreContracts"]
+        ),
+        .testTarget(
             name: "OrchestrationTests",
             dependencies: [
                 "Orchestration",

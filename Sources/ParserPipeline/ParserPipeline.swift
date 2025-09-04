@@ -35,10 +35,12 @@ public struct InboundMessage: Sendable {
 public struct ParsedUpdate: Sendable {
     public var card: UpdateCard
     public var extractedDueDateText: String?
+    public var templateType: String
 
-    public init(card: UpdateCard, extractedDueDateText: String? = nil) {
+    public init(card: UpdateCard, extractedDueDateText: String? = nil, templateType: String = "generic") {
         self.card = card
         self.extractedDueDateText = extractedDueDateText
+        self.templateType = templateType
     }
 }
 
@@ -89,13 +91,18 @@ public enum ParserPipeline {
 
     private static func parseSingle(message: InboundMessage, overrideBody: String?, syntheticSuffix: String?) -> ParsedUpdate {
         let body = overrideBody ?? message.bodyText
-        let tags = classifyTags(subject: message.subject, body: body)
+        let template = classifyTemplate(source: message.source, sender: message.from, subject: message.subject, body: body)
+        var tags = classifyTags(subject: message.subject, body: body)
+        tags.append("template:\(template)")
         let dueDateText = extractDueDateText(from: message.subject + "\n" + body)
-        let requiresConfirmation = dueDateText == nil && tags.contains("type:assignment")
+        let requiresConfirmation = dueDateText == nil && (
+            tags.contains("type:assignment") || template.contains("digest") || template == "unknown"
+        )
 
         let confidence = confidenceScore(
             hasDueDate: dueDateText != nil,
             hasCourseTag: tags.contains(where: { $0.hasPrefix("course:") }),
+            hasKnownTemplate: template != "unknown",
             requiresConfirmation: requiresConfirmation
         )
 
@@ -117,7 +124,7 @@ public enum ParserPipeline {
             requiresConfirmation: requiresConfirmation
         )
 
-        return ParsedUpdate(card: card, extractedDueDateText: dueDateText)
+        return ParsedUpdate(card: card, extractedDueDateText: dueDateText, templateType: template)
     }
 
     private static func isTrustedSender(_ sender: String, patterns: [String]) -> Bool {
@@ -132,7 +139,9 @@ public enum ParserPipeline {
         }
 
         let lines = body.split(separator: "\n").map { String($0).trimmingCharacters(in: .whitespacesAndNewlines) }
-        let bullets = lines.filter { $0.hasPrefix("-") || $0.hasPrefix("*") || $0.hasPrefix("•") }
+        let bullets = lines.filter {
+            $0.hasPrefix("-") || $0.hasPrefix("*") || $0.hasPrefix("•") || $0.range(of: #"^\d+[.)]\s+"#, options: .regularExpression) != nil
+        }
         return bullets.isEmpty ? [body] : bullets
     }
 
@@ -158,7 +167,7 @@ public enum ParserPipeline {
     }
 
     private static func extractCourseCode(from text: String) -> String? {
-        let pattern = #"\b([a-z]{3}\d{3})\b"#
+        let pattern = #"\b([a-z]{3}\s?\d{3})\b"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: []) else {
             return nil
         }
@@ -170,11 +179,11 @@ public enum ParserPipeline {
             return nil
         }
 
-        return String(text[codeRange]).uppercased()
+        return String(text[codeRange]).replacingOccurrences(of: " ", with: "").uppercased()
     }
 
     private static func extractDueDateText(from text: String) -> String? {
-        let pattern = #"(due\s+(on\s+)?[a-z]{3,9}\s+\d{1,2}(,\s*\d{4})?(\s+at\s+\d{1,2}:?\d{0,2}\s*(am|pm)?)?)"#
+        let pattern = #"((due|by)\s+(on\s+)?[a-z]{3,9}\s+\d{1,2}(,\s*\d{4})?(\s+at\s+\d{1,2}:?\d{0,2}\s*(am|pm)?)?)"#
         guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
             return nil
         }
@@ -189,10 +198,42 @@ public enum ParserPipeline {
         return String(text[dueRange]).trimmingCharacters(in: .whitespacesAndNewlines)
     }
 
-    private static func confidenceScore(hasDueDate: Bool, hasCourseTag: Bool, requiresConfirmation: Bool) -> Double {
+    private static func classifyTemplate(source: UpdateSource, sender: String, subject: String, body: String) -> String {
+        let normalizedSender = sender.lowercased()
+        let normalizedSubject = subject.lowercased()
+        let normalizedBody = body.lowercased()
+
+        if source == .piazzaEmail || normalizedSender.contains("piazza") {
+            if normalizedSubject.contains("digest") || normalizedSubject.contains("summary") {
+                return "piazza_digest"
+            }
+            if normalizedSubject.contains("new post") || normalizedBody.contains("instructor note") {
+                return "piazza_realtime"
+            }
+            return "piazza_generic"
+        }
+
+        if source == .ublearnsEmail || normalizedSender.contains("buffalo.edu") || normalizedSender.contains("instructure") || normalizedSender.contains("ublearns") {
+            if normalizedSubject.contains("assignment") {
+                return "ublearns_assignment"
+            }
+            if normalizedSubject.contains("quiz") || normalizedSubject.contains("exam") {
+                return "ublearns_quiz"
+            }
+            if normalizedSubject.contains("announcement") {
+                return "ublearns_announcement"
+            }
+            return "ublearns_generic"
+        }
+
+        return "unknown"
+    }
+
+    private static func confidenceScore(hasDueDate: Bool, hasCourseTag: Bool, hasKnownTemplate: Bool, requiresConfirmation: Bool) -> Double {
         var score = 0.50
         if hasDueDate { score += 0.25 }
         if hasCourseTag { score += 0.20 }
+        if hasKnownTemplate { score += 0.10 }
         if requiresConfirmation { score -= 0.25 }
         return max(0.0, min(score, 0.99))
     }
