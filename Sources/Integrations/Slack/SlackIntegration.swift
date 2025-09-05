@@ -41,6 +41,7 @@ public enum PlanCommand: Sendable, Equatable {
     case today
     case add(title: String, start: Date, durationMinutes: Int)
     case move(title: String, start: Date, durationMinutes: Int?)
+    case undo
     case help
 }
 
@@ -81,6 +82,10 @@ public enum PlanCommandParser {
 
         if lower == "help" {
             return .help
+        }
+
+        if lower == "undo" {
+            return .undo
         }
 
         if lower.hasPrefix("add ") {

@@ -17,10 +17,16 @@ public struct PlanCommandResponse: Sendable {
 }
 
 public actor PlanCommandService {
+    private enum UndoOperation: Sendable {
+        case createdBlock(blockID: UUID, ekEventID: String?)
+        case movedBlock(previous: CalendarBlock)
+    }
+
     private let calendarStore: CalendarStore
     private let managedCalendarName: String
     private var currentPlanRevision: Int
     private let calendar: Calendar
+    private var undoStack: [UndoOperation]
 
     public init(
         calendarStore: CalendarStore,
@@ -32,6 +38,7 @@ public actor PlanCommandService {
         self.managedCalendarName = managedCalendarName
         self.currentPlanRevision = initialPlanRevision
         self.calendar = calendar
+        self.undoStack = []
     }
 
     public func handle(commandText: String, now: Date = Date()) async -> PlanCommandResponse {
@@ -46,9 +53,11 @@ public actor PlanCommandService {
                 return try await handleAdd(title: title, start: start, durationMinutes: durationMinutes)
             case let .move(title, start, durationMinutes):
                 return try await handleMove(title: title, start: start, durationMinutes: durationMinutes)
+            case .undo:
+                return try await handleUndo()
             case .help:
                 return PlanCommandResponse(
-                    text: "Supported: /plan today, /plan add \"Title\" 60m [today|tomorrow] [7:00pm], /plan move \"Title\" tomorrow 7:00pm [60m]",
+                    text: "Supported: /plan today, /plan add \"Title\" 60m [today|tomorrow] [7:00pm], /plan move \"Title\" tomorrow 7:00pm [60m], /plan undo",
                     planRevision: currentPlanRevision
                 )
             }
@@ -119,7 +128,9 @@ public actor PlanCommandService {
                 planRevision: currentPlanRevision
             )
 
-            _ = try await calendarStore.createManagedBlock(block, calendarName: managedCalendarName)
+            let created = try await calendarStore.createManagedBlock(block, calendarName: managedCalendarName)
+            undoStack.append(.createdBlock(blockID: created.blockID, ekEventID: created.ekEventID))
+            trimUndoStack()
 
             return PlanCommandResponse(
                 text: "Added \"\(title)\" for \(durationMinutes)m. Plan revision: \(currentPlanRevision)",
@@ -154,6 +165,7 @@ public actor PlanCommandService {
         let oldDuration = Int(target.endLocal.timeIntervalSince(target.startLocal) / 60)
         let newDuration = durationMinutes ?? max(30, oldDuration)
         let newEnd = start.addingTimeInterval(TimeInterval(newDuration * 60))
+        let original = target
 
         let operation = EditOperation(
             expectedPlanRevision: currentPlanRevision,
@@ -184,11 +196,48 @@ public actor PlanCommandService {
             target.planRevision = currentPlanRevision
 
             _ = try await calendarStore.updateManagedBlock(target, calendarName: managedCalendarName)
+            undoStack.append(.movedBlock(previous: original))
+            trimUndoStack()
 
             return PlanCommandResponse(
                 text: "Moved \"\(target.title)\" to \(isoLocal(start)). Plan revision: \(currentPlanRevision)",
                 planRevision: currentPlanRevision
             )
+        }
+    }
+
+    private func handleUndo() async throws -> PlanCommandResponse {
+        guard let lastOperation = undoStack.popLast() else {
+            return PlanCommandResponse(text: "Nothing to undo.", planRevision: currentPlanRevision)
+        }
+
+        currentPlanRevision += 1
+
+        switch lastOperation {
+        case let .createdBlock(blockID, ekEventID):
+            try await calendarStore.deleteManagedBlock(
+                blockID: blockID,
+                ekEventID: ekEventID,
+                calendarName: managedCalendarName
+            )
+            return PlanCommandResponse(
+                text: "Undo complete: removed last created block. Plan revision: \(currentPlanRevision)",
+                planRevision: currentPlanRevision
+            )
+        case let .movedBlock(previous):
+            var reverted = previous
+            reverted.planRevision = currentPlanRevision
+            _ = try await calendarStore.updateManagedBlock(reverted, calendarName: managedCalendarName)
+            return PlanCommandResponse(
+                text: "Undo complete: restored previous block timing. Plan revision: \(currentPlanRevision)",
+                planRevision: currentPlanRevision
+            )
+        }
+    }
+
+    private func trimUndoStack(maxEntries: Int = 100) {
+        if undoStack.count > maxEntries {
+            undoStack.removeFirst(undoStack.count - maxEntries)
         }
     }
 
