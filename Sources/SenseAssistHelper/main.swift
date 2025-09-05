@@ -5,6 +5,7 @@ import GmailIntegration
 import Ingestion
 import LLMRuntime
 import Orchestration
+import OutlookIntegration
 import ParserPipeline
 import Planner
 import RulesEngine
@@ -42,6 +43,14 @@ struct SenseAssistHelperMain {
                 let summary = try await runGmailSyncDemo(config: config, logger: logger)
                 print(
                     "Gmail sync summary: fetched=\(summary.fetchedMessages) parsed=\(summary.parsedUpdates) stored_updates=\(summary.storedUpdates) tasks=\(summary.createdOrUpdatedTasks) next_cursor=\(summary.nextCursor ?? "nil")"
+                )
+                Foundation.exit(0)
+            }
+
+            if ProcessInfo.processInfo.arguments.contains("--outlook-sync-demo") {
+                let summary = try await runOutlookSyncDemo(config: config, logger: logger)
+                print(
+                    "Outlook sync summary: fetched=\(summary.fetchedMessages) parsed=\(summary.parsedUpdates) stored_updates=\(summary.storedUpdates) tasks=\(summary.createdOrUpdatedTasks) next_cursor=\(summary.nextCursor ?? "nil")"
                 )
                 Foundation.exit(0)
             }
@@ -99,6 +108,45 @@ struct SenseAssistHelperMain {
         )
         let service = GmailIngestionService(
             gmailClient: client,
+            cursorRepository: cursorRepository,
+            updateRepository: updateRepository,
+            taskRepository: taskRepository,
+            llmRuntime: llmRuntime,
+            confidenceThreshold: config.confidenceThreshold
+        )
+
+        let summary = try await service.sync()
+        store.close()
+        return summary
+    }
+
+    private static func runOutlookSyncDemo(config: SenseAssistConfiguration, logger: Logging) async throws -> OutlookSyncSummary {
+        let store = SQLiteStore(databasePath: config.databasePath, logger: logger)
+        try store.initialize()
+
+        let cursorRepository = ProviderCursorRepository(store: store)
+        let updateRepository = UpdateRepository(store: store)
+        let taskRepository = TaskRepository(store: store)
+        let llmRuntime = StubLLMRuntime()
+
+        let sampleMessage = OutlookMessage(
+            messageID: "out-demo-1",
+            conversationID: "conv-1",
+            receivedDateTime: Date(),
+            from: "noreply@buffalo.edu",
+            subject: "CSE331 quiz reminder due by March 3 at 5pm",
+            bodyText: "Quiz posted. Please submit by March 3 at 5pm.",
+            links: ["https://ublearns.buffalo.edu"]
+        )
+
+        let client = StubOutlookClient(
+            pages: [
+                (cursor: nil, messages: [sampleMessage], nextCursor: "outlook-cursor-v1"),
+                (cursor: "outlook-cursor-v1", messages: [], nextCursor: "outlook-cursor-v1")
+            ]
+        )
+        let service = OutlookIngestionService(
+            outlookClient: client,
             cursorRepository: cursorRepository,
             updateRepository: updateRepository,
             taskRepository: taskRepository,
