@@ -322,6 +322,58 @@ public enum DefaultMigrations {
                 );
                 """
             ]
+        ),
+        SQLMigration(
+            id: "003_multi_account_support",
+            statements: [
+                """
+                CREATE TABLE IF NOT EXISTS accounts (
+                  account_id TEXT PRIMARY KEY,
+                  provider TEXT NOT NULL,
+                  email TEXT NOT NULL UNIQUE,
+                  is_enabled INTEGER NOT NULL DEFAULT 1,
+                  created_at_utc TEXT NOT NULL,
+                  updated_at_utc TEXT NOT NULL
+                );
+                """,
+                "ALTER TABLE provider_cursors RENAME TO provider_cursors_legacy;",
+                """
+                CREATE TABLE provider_cursors (
+                  provider TEXT NOT NULL,
+                  account_id TEXT NOT NULL,
+                  cursor_primary TEXT NOT NULL,
+                  cursor_secondary TEXT,
+                  updated_at_utc TEXT NOT NULL,
+                  PRIMARY KEY (provider, account_id)
+                );
+                """,
+                """
+                INSERT INTO provider_cursors(provider, account_id, cursor_primary, cursor_secondary, updated_at_utc)
+                SELECT provider, 'default', cursor_primary, cursor_secondary, updated_at_utc
+                FROM provider_cursors_legacy;
+                """,
+                "DROP TABLE provider_cursors_legacy;",
+                "ALTER TABLE updates ADD COLUMN account_id TEXT NOT NULL DEFAULT 'default';",
+                "DROP INDEX IF EXISTS idx_updates_provider;",
+                "CREATE UNIQUE INDEX IF NOT EXISTS idx_updates_provider ON updates(source, account_id, message_id);",
+                "ALTER TABLE task_sources RENAME TO task_sources_legacy;",
+                """
+                CREATE TABLE task_sources (
+                  task_id TEXT NOT NULL,
+                  source TEXT NOT NULL,
+                  account_id TEXT NOT NULL,
+                  message_id TEXT NOT NULL,
+                  confidence REAL NOT NULL,
+                  PRIMARY KEY (task_id, source, account_id, message_id)
+                );
+                """,
+                """
+                INSERT INTO task_sources(task_id, source, account_id, message_id, confidence)
+                SELECT task_id, source, 'default', message_id, confidence
+                FROM task_sources_legacy;
+                """,
+                "DROP TABLE task_sources_legacy;"
+            ]
         )
     ]
 }

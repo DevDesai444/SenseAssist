@@ -24,6 +24,7 @@ public enum ParserMethod: String, Codable, Sendable {
 
 public struct UpdateCard: Codable, Equatable, Sendable {
     public var updateID: UUID
+    public var accountID: String
     public var source: UpdateSource
     public var providerIDs: ProviderIDs
     public var receivedAtUTC: Date
@@ -39,6 +40,7 @@ public struct UpdateCard: Codable, Equatable, Sendable {
 
     public init(
         updateID: UUID = UUID(),
+        accountID: String = "default",
         source: UpdateSource,
         providerIDs: ProviderIDs,
         receivedAtUTC: Date,
@@ -53,6 +55,7 @@ public struct UpdateCard: Codable, Equatable, Sendable {
         requiresConfirmation: Bool = false
     ) {
         self.updateID = updateID
+        self.accountID = accountID
         self.source = source
         self.providerIDs = providerIDs
         self.receivedAtUTC = receivedAtUTC
@@ -93,11 +96,13 @@ public enum FeasibilityState: String, Codable, Sendable {
 
 public struct TaskSource: Codable, Equatable, Sendable {
     public var source: UpdateSource
+    public var accountID: String
     public var messageID: String
     public var confidence: Double
 
-    public init(source: UpdateSource, messageID: String, confidence: Double) {
+    public init(source: UpdateSource, accountID: String = "default", messageID: String, confidence: Double) {
         self.source = source
+        self.accountID = accountID
         self.messageID = messageID
         self.confidence = confidence
     }
