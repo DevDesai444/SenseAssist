@@ -15,6 +15,7 @@ let package = Package(
         .library(name: "ParserPipeline", targets: ["ParserPipeline"]),
         .library(name: "Orchestration", targets: ["Orchestration"]),
         .library(name: "Ingestion", targets: ["Ingestion"]),
+        .library(name: "Auth", targets: ["Auth"]),
         .library(name: "SlackIntegration", targets: ["SlackIntegration"]),
         .library(name: "GmailIntegration", targets: ["GmailIntegration"]),
         .library(name: "OutlookIntegration", targets: ["OutlookIntegration"]),
@@ -29,6 +30,7 @@ let package = Package(
         .target(name: "Planner", dependencies: ["CoreContracts"]),
         .target(name: "LLMRuntime", dependencies: ["CoreContracts"]),
         .target(name: "ParserPipeline", dependencies: ["CoreContracts"]),
+        .target(name: "Auth"),
         .target(
             name: "Orchestration",
             dependencies: [
@@ -86,7 +88,8 @@ let package = Package(
                 "SlackIntegration",
                 "Ingestion",
                 "GmailIntegration",
-                "OutlookIntegration"
+                "OutlookIntegration",
+                "Auth"
             ]
         ),
         .executableTarget(
