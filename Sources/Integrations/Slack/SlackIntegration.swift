@@ -19,6 +19,134 @@ public protocol SlackSocketClient: Sendable {
     func sendMessage(_ text: String, channelID: String) async throws
 }
 
+public enum SlackClientError: Error, LocalizedError {
+    case invalidResponse
+    case apiError(code: Int, body: String)
+    case socketURLUnavailable
+
+    public var errorDescription: String? {
+        switch self {
+        case .invalidResponse:
+            return "Invalid response from Slack API"
+        case let .apiError(code, body):
+            return "Slack API error \(code): \(body)"
+        case .socketURLUnavailable:
+            return "Slack Socket Mode URL unavailable"
+        }
+    }
+}
+
+public actor SlackWebAPIClient: SlackSocketClient {
+    private let botToken: String
+    private let appLevelToken: String?
+    private let session: URLSession
+    private var socketTask: URLSessionWebSocketTask?
+
+    public init(botToken: String, appLevelToken: String? = nil, session: URLSession = .shared) {
+        self.botToken = botToken
+        self.appLevelToken = appLevelToken
+        self.session = session
+    }
+
+    public func connect() async throws {
+        guard let appLevelToken else {
+            return
+        }
+
+        var request = URLRequest(url: URL(string: "https://slack.com/api/apps.connections.open")!)
+        request.httpMethod = "POST"
+        request.setValue("Bearer \(appLevelToken)", forHTTPHeaderField: "Authorization")
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw SlackClientError.invalidResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw SlackClientError.apiError(code: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+        }
+
+        let socketResponse = try JSONDecoder().decode(SocketOpenResponse.self, from: data)
+        guard socketResponse.ok, let urlString = socketResponse.url, let url = URL(string: urlString) else {
+            throw SlackClientError.socketURLUnavailable
+        }
+
+        let socket = session.webSocketTask(with: url)
+        socket.resume()
+        self.socketTask = socket
+        receiveLoop()
+    }
+
+    public func disconnect() async {
+        socketTask?.cancel(with: .goingAway, reason: nil)
+        socketTask = nil
+    }
+
+    public func sendMessage(_ text: String, channelID: String) async throws {
+        let url = URL(string: "https://slack.com/api/chat.postMessage")!
+        var request = URLRequest(url: url)
+        request.httpMethod = "POST"
+        request.setValue("application/json", forHTTPHeaderField: "Content-Type")
+        request.setValue("Bearer \(botToken)", forHTTPHeaderField: "Authorization")
+        request.httpBody = try JSONEncoder().encode(PostMessageRequest(channel: channelID, text: text))
+
+        let (data, response) = try await session.data(for: request)
+        guard let http = response as? HTTPURLResponse else {
+            throw SlackClientError.invalidResponse
+        }
+        guard (200...299).contains(http.statusCode) else {
+            throw SlackClientError.apiError(code: http.statusCode, body: String(data: data, encoding: .utf8) ?? "")
+        }
+
+        let apiResponse = try JSONDecoder().decode(ChatPostMessageResponse.self, from: data)
+        if !apiResponse.ok {
+            throw SlackClientError.apiError(code: http.statusCode, body: apiResponse.error ?? "unknown_error")
+        }
+    }
+
+    private func receiveLoop() {
+        guard let socketTask else { return }
+
+        socketTask.receive { [weak self] result in
+            guard let self else { return }
+            Task { await self.handleSocketMessage(result) }
+            Task { await self.receiveLoop() }
+        }
+    }
+
+    private func handleSocketMessage(_ result: Result<URLSessionWebSocketTask.Message, Error>) async {
+        guard case let .success(message) = result else { return }
+        let payloadData: Data?
+        switch message {
+        case let .string(text):
+            payloadData = text.data(using: .utf8)
+        case let .data(data):
+            payloadData = data
+        @unknown default:
+            payloadData = nil
+        }
+
+        guard let payloadData,
+              let envelope = try? JSONDecoder().decode(SocketEnvelope.self, from: payloadData),
+              let envelopeID = envelope.envelopeID else {
+            return
+        }
+
+        do {
+            try await sendSocketAck(envelopeID: envelopeID)
+        } catch {
+            // Ignore ack failures; reconnect strategy handled externally.
+        }
+    }
+
+    private func sendSocketAck(envelopeID: String) async throws {
+        guard let socketTask else { return }
+        let ack = SocketAck(envelopeID: envelopeID)
+        let data = try JSONEncoder().encode(ack)
+        let text = String(data: data, encoding: .utf8) ?? "{\"envelope_id\":\"\(envelopeID)\"}"
+        try await socketTask.send(.string(text))
+    }
+}
+
 public actor StubSlackSocketClient: SlackSocketClient {
     public private(set) var isConnected: Bool = false
 
@@ -34,6 +162,37 @@ public actor StubSlackSocketClient: SlackSocketClient {
 
     public func sendMessage(_ text: String, channelID: String) async throws {
         _ = "[stub] send to \(channelID): \(text)"
+    }
+}
+
+private struct PostMessageRequest: Encodable {
+    let channel: String
+    let text: String
+}
+
+private struct ChatPostMessageResponse: Decodable {
+    let ok: Bool
+    let error: String?
+}
+
+private struct SocketOpenResponse: Decodable {
+    let ok: Bool
+    let url: String?
+}
+
+private struct SocketEnvelope: Decodable {
+    let envelopeID: String?
+
+    enum CodingKeys: String, CodingKey {
+        case envelopeID = "envelope_id"
+    }
+}
+
+private struct SocketAck: Encodable {
+    let envelopeID: String
+
+    enum CodingKeys: String, CodingKey {
+        case envelopeID = "envelope_id"
     }
 }
 
