@@ -1,3 +1,4 @@
+import Auth
 import CoreContracts
 import EventKitAdapter
 import Foundation
@@ -87,6 +88,12 @@ struct SenseAssistHelperMain {
 
             if ProcessInfo.processInfo.arguments.contains("--sync-all-demo") {
                 let report = try await runMultiAccountSyncDemo(config: config, logger: logger)
+                print(report)
+                Foundation.exit(0)
+            }
+
+            if ProcessInfo.processInfo.arguments.contains("--sync-live-once") {
+                let report = try await runMultiAccountSyncLive(config: config, logger: logger)
                 print(report)
                 Foundation.exit(0)
             }
@@ -280,5 +287,169 @@ struct SenseAssistHelperMain {
 
         store.close()
         return lines.joined(separator: "\n")
+    }
+
+    private static func runMultiAccountSyncLive(config: SenseAssistConfiguration, logger: Logging) async throws -> String {
+        let store = SQLiteStore(databasePath: config.databasePath, logger: logger)
+        try store.initialize()
+        defer { store.close() }
+
+        let accountRepository = AccountRepository(store: store)
+        var enabledAccounts = try accountRepository.list(enabledOnly: true)
+
+        if enabledAccounts.isEmpty {
+            for account in defaultMultiAccounts {
+                try accountRepository.upsert(account)
+            }
+            enabledAccounts = try accountRepository.list(enabledOnly: true)
+        }
+
+        guard !enabledAccounts.isEmpty else {
+            throw LiveSyncError.noEnabledAccounts
+        }
+
+        let cursorRepository = ProviderCursorRepository(store: store)
+        let updateRepository = UpdateRepository(store: store)
+        let taskRepository = TaskRepository(store: store)
+        let credentialStore = ChainedCredentialStore(stores: [KeychainCredentialStore(), EnvironmentCredentialStore()])
+        let llmRuntime = configuredLLMRuntime()
+
+        var gmailTokens: [String: String] = [:]
+        var outlookTokens: [String: String] = [:]
+        var skippedAccounts: [String] = []
+
+        for account in enabledAccounts {
+            switch account.provider {
+            case .gmail:
+                if let credential = try loadCredential(
+                    store: credentialStore,
+                    provider: .gmail,
+                    accountID: account.accountID,
+                    email: account.email
+                ) {
+                    gmailTokens[account.accountID] = credential.accessToken
+                } else {
+                    skippedAccounts.append("gmail \(account.email): missing OAuth token")
+                }
+            case .outlook:
+                if let credential = try loadCredential(
+                    store: credentialStore,
+                    provider: .outlook,
+                    accountID: account.accountID,
+                    email: account.email
+                ) {
+                    outlookTokens[account.accountID] = credential.accessToken
+                } else {
+                    skippedAccounts.append("outlook \(account.email): missing OAuth token")
+                }
+            }
+        }
+
+        if gmailTokens.isEmpty && outlookTokens.isEmpty {
+            throw LiveSyncError.noCredentialsConfigured
+        }
+
+        let coordinator = MultiAccountSyncCoordinator(
+            accountRepository: accountRepository,
+            cursorRepository: cursorRepository,
+            updateRepository: updateRepository,
+            taskRepository: taskRepository,
+            llmRuntime: llmRuntime,
+            confidenceThreshold: config.confidenceThreshold,
+            gmailClientFactory: { account in
+                guard account.provider == .gmail, let token = gmailTokens[account.accountID] else {
+                    return nil
+                }
+                return GoogleGmailAPIClient(accessToken: token)
+            },
+            outlookClientFactory: { account in
+                guard account.provider == .outlook, let token = outlookTokens[account.accountID] else {
+                    return nil
+                }
+                return MicrosoftGraphOutlookClient(accessToken: token)
+            }
+        )
+
+        let result = try await coordinator.syncAllEnabledAccounts()
+        let totalUpdates = try updateRepository.count()
+        let totalTasks = try taskRepository.count()
+
+        var lines: [String] = ["Live accounts sync summary:"]
+        lines.append(
+            contentsOf: result.gmail.map {
+                "gmail \($0.accountEmail): fetched=\($0.fetchedMessages) stored_updates=\($0.storedUpdates) tasks=\($0.createdOrUpdatedTasks)"
+            }
+        )
+        lines.append(
+            contentsOf: result.outlook.map {
+                "outlook \($0.accountEmail): fetched=\($0.fetchedMessages) stored_updates=\($0.storedUpdates) tasks=\($0.createdOrUpdatedTasks)"
+            }
+        )
+        lines.append("skipped_accounts=\(skippedAccounts.count)")
+        lines.append(contentsOf: skippedAccounts.map { "skipped: \($0)" })
+        lines.append(
+            "totals: fetched=\(result.totalFetched) updates=\(totalUpdates) tasks=\(totalTasks) enabled_accounts=\(enabledAccounts.count)"
+        )
+
+        return lines.joined(separator: "\n")
+    }
+
+    private static func configuredLLMRuntime() -> LLMRuntimeClient {
+        let environment = ProcessInfo.processInfo.environment
+
+        if let onnxModelPath = environment["SENSEASSIST_ONNX_MODEL_PATH"], !onnxModelPath.isEmpty {
+            let runnerPath = environment["SENSEASSIST_ONNX_RUNNER"] ?? "Scripts/onnx_genai_runner.py"
+            let pythonPath = environment["SENSEASSIST_ONNX_PYTHON"] ?? "/usr/bin/python3"
+            let maxNewTokens = Int(environment["SENSEASSIST_ONNX_MAX_NEW_TOKENS"] ?? "") ?? 512
+            let temperature = Double(environment["SENSEASSIST_ONNX_TEMPERATURE"] ?? "") ?? 0.2
+            let topP = Double(environment["SENSEASSIST_ONNX_TOP_P"] ?? "") ?? 0.95
+            let provider = environment["SENSEASSIST_ONNX_PROVIDER"]
+
+            return ONNXGenAILLMRuntime(
+                modelPath: onnxModelPath,
+                runnerScriptPath: runnerPath,
+                pythonExecutable: pythonPath,
+                maxNewTokens: maxNewTokens,
+                temperature: temperature,
+                topP: topP,
+                provider: provider
+            )
+        }
+
+        let model = environment["SENSEASSIST_OLLAMA_MODEL"] ?? "llama3.1:8b"
+        let endpoint = URL(string: environment["SENSEASSIST_OLLAMA_ENDPOINT"] ?? "http://127.0.0.1:11434") ??
+            URL(string: "http://127.0.0.1:11434")!
+        return OllamaLLMRuntime(endpointURL: endpoint, model: model)
+    }
+
+    private static func loadCredential(
+        store: CredentialStore,
+        provider: CredentialProvider,
+        accountID: String,
+        email: String
+    ) throws -> OAuthCredential? {
+        if let primary = try store.load(provider: provider, accountID: accountID), !primary.accessToken.isEmpty {
+            return primary
+        }
+
+        if let emailScoped = try store.load(provider: provider, accountID: email), !emailScoped.accessToken.isEmpty {
+            return emailScoped
+        }
+
+        return nil
+    }
+}
+
+private enum LiveSyncError: Error, LocalizedError {
+    case noEnabledAccounts
+    case noCredentialsConfigured
+
+    var errorDescription: String? {
+        switch self {
+        case .noEnabledAccounts:
+            return "No enabled Gmail/Outlook accounts are configured."
+        case .noCredentialsConfigured:
+            return "No OAuth tokens found for enabled accounts. Configure tokens in Keychain or environment variables."
+        }
     }
 }
