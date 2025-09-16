@@ -28,8 +28,8 @@ import Testing
 
     let gmail = StubGmailClient(
         pages: [
-            (cursor: nil, messages: [message], nextCursor: "c1"),
-            (cursor: "c1", messages: [], nextCursor: "c1")
+            (cursor: nil, messages: [message], nextCursor: GmailSyncCursor(internalDateSeconds: Int(message.internalDate.timeIntervalSince1970), messageID: message.messageID)),
+            (cursor: GmailSyncCursor(internalDateSeconds: Int(message.internalDate.timeIntervalSince1970), messageID: message.messageID), messages: [], nextCursor: GmailSyncCursor(internalDateSeconds: Int(message.internalDate.timeIntervalSince1970), messageID: message.messageID))
         ]
     )
 
@@ -48,7 +48,7 @@ import Testing
     #expect(first.fetchedMessages == 1)
     #expect(first.storedUpdates == 1)
     #expect(first.createdOrUpdatedTasks == 1)
-    #expect(first.nextCursor == "c1")
+    #expect(first.nextCursor == "\(Int(message.internalDate.timeIntervalSince1970))")
 
     let second = try await service.sync()
     #expect(second.fetchedMessages == 0)
@@ -78,7 +78,18 @@ import Testing
         links: []
     )
 
-    let gmail = StubGmailClient(pages: [(cursor: nil, messages: [suspicious], nextCursor: "c2")])
+    let gmail = StubGmailClient(
+        pages: [
+            (
+                cursor: nil,
+                messages: [suspicious],
+                nextCursor: GmailSyncCursor(
+                    internalDateSeconds: Int(suspicious.internalDate.timeIntervalSince1970),
+                    messageID: suspicious.messageID
+                )
+            )
+        ]
+    )
 
     let service = GmailIngestionService(
         accountID: "gmail:devdesaiofficial@gmail.com",
@@ -136,7 +147,18 @@ import Testing
     let serviceA = GmailIngestionService(
         accountID: "gmail:devdesaiyt@gmail.com",
         accountEmail: "devdesaiyt@gmail.com",
-        gmailClient: StubGmailClient(pages: [(cursor: nil, messages: [sharedMessageA], nextCursor: "ca")]),
+        gmailClient: StubGmailClient(
+            pages: [
+                (
+                    cursor: nil,
+                    messages: [sharedMessageA],
+                    nextCursor: GmailSyncCursor(
+                        internalDateSeconds: Int(sharedMessageA.internalDate.timeIntervalSince1970),
+                        messageID: sharedMessageA.messageID
+                    )
+                )
+            ]
+        ),
         cursorRepository: repos.cursor,
         updateRepository: repos.updates,
         taskRepository: repos.tasks,
@@ -147,7 +169,18 @@ import Testing
     let serviceB = GmailIngestionService(
         accountID: "gmail:devdesaiofficial@gmail.com",
         accountEmail: "devdesaiofficial@gmail.com",
-        gmailClient: StubGmailClient(pages: [(cursor: nil, messages: [sharedMessageB], nextCursor: "cb")]),
+        gmailClient: StubGmailClient(
+            pages: [
+                (
+                    cursor: nil,
+                    messages: [sharedMessageB],
+                    nextCursor: GmailSyncCursor(
+                        internalDateSeconds: Int(sharedMessageB.internalDate.timeIntervalSince1970),
+                        messageID: sharedMessageB.messageID
+                    )
+                )
+            ]
+        ),
         cursorRepository: repos.cursor,
         updateRepository: repos.updates,
         taskRepository: repos.tasks,
