@@ -1,4 +1,5 @@
 import CoreContracts
+import CryptoKit
 import Foundation
 
 public enum StorageProvider: String, Sendable {
@@ -125,7 +126,7 @@ public final class UpdateRepository {
             let tagsJSON = jsonArray(update.tags)
             let received = ISO8601DateFormatter().string(from: update.receivedAtUTC)
             let created = ISO8601DateFormatter().string(from: Date())
-            let contentHash = "\(abs(update.bodyText.hashValue))"
+            let contentHash = stableContentHash(update.bodyText)
             let requiresConfirmation = update.requiresConfirmation ? 1 : 0
 
             let sql = """
@@ -188,6 +189,11 @@ public final class UpdateRepository {
             return "[]"
         }
         return json
+    }
+
+    private func stableContentHash(_ value: String) -> String {
+        let digest = SHA256.hash(data: Data(value.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
     }
 }
 
@@ -268,6 +274,60 @@ public final class TaskRepository {
     public func count() throws -> Int {
         let sql = "SELECT COUNT(*) AS n FROM tasks;"
         return try store.fetchRows(sql).first?["n"].flatMap(Int.init) ?? 0
+    }
+
+    public func listActive() throws -> [TaskItem] {
+        let sql = """
+        SELECT task_id, title, category, due_at_local, estimated_minutes, min_daily_minutes,
+               priority, stress_weight, feasibility_state, status
+        FROM tasks
+        WHERE status IN ('todo', 'in_progress')
+        ORDER BY priority DESC, due_at_local ASC, updated_at_utc DESC;
+        """
+
+        let formatter = ISO8601DateFormatter()
+        return try store.fetchRows(sql).compactMap { row in
+            guard
+                let taskIDRaw = row["task_id"],
+                let taskID = UUID(uuidString: taskIDRaw),
+                let title = row["title"],
+                let categoryRaw = row["category"],
+                let category = TaskCategory(rawValue: categoryRaw),
+                let estimatedRaw = row["estimated_minutes"],
+                let estimatedMinutes = Int(estimatedRaw),
+                let minDailyRaw = row["min_daily_minutes"],
+                let minDailyMinutes = Int(minDailyRaw),
+                let priorityRaw = row["priority"],
+                let priority = Int(priorityRaw),
+                let stressRaw = row["stress_weight"],
+                let stressWeight = Double(stressRaw),
+                let feasibilityRaw = row["feasibility_state"],
+                let feasibility = FeasibilityState(rawValue: feasibilityRaw),
+                let statusRaw = row["status"],
+                let status = TaskStatus(rawValue: statusRaw)
+            else {
+                return nil
+            }
+
+            let dueAtLocal = row["due_at_local"].flatMap { value -> Date? in
+                guard !value.isEmpty else { return nil }
+                return formatter.date(from: value)
+            }
+
+            return TaskItem(
+                taskID: taskID,
+                title: title,
+                category: category,
+                dueAtLocal: dueAtLocal,
+                estimatedMinutes: estimatedMinutes,
+                minDailyMinutes: minDailyMinutes,
+                priority: priority,
+                stressWeight: stressWeight,
+                feasibilityState: feasibility,
+                sources: [],
+                status: status
+            )
+        }
     }
 
     private func buildDedupeKey(_ task: TaskItem) -> String {
@@ -396,6 +456,161 @@ public final class AuditLogRepository: @unchecked Sendable {
         let whereClause = category.map { " WHERE category = '\(escape($0))'" } ?? ""
         let sql = "SELECT COUNT(*) AS n FROM audit_log\(whereClause);"
         return try store.fetchRows(sql).first?["n"].flatMap(Int.init) ?? 0
+    }
+
+    private func escape(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "''")
+    }
+}
+
+public final class PlanRevisionRepository {
+    private let store: SQLiteStore
+
+    public init(store: SQLiteStore) {
+        self.store = store
+    }
+
+    public func latestRevisionID() throws -> Int {
+        let sql = "SELECT COALESCE(MAX(revision_id), 0) AS n FROM plan_revisions;"
+        return try store.fetchRows(sql).first?["n"].flatMap(Int.init) ?? 0
+    }
+
+    @discardableResult
+    public func append(trigger: String, summary: PlanSummary) throws -> Int {
+        let summaryJSON: String
+        if let data = try? JSONEncoder().encode(summary), let text = String(data: data, encoding: .utf8) {
+            summaryJSON = text
+        } else {
+            summaryJSON = "{\"createdBlocks\":0,\"movedBlocks\":0,\"deletedBlocks\":0}"
+        }
+
+        let sql = """
+        INSERT INTO plan_revisions (trigger, summary_json, created_at_utc)
+        VALUES (
+          '\(escape(trigger))',
+          '\(escape(summaryJSON))',
+          '\(timestamp())'
+        );
+        """
+        try store.execute(sql)
+
+        let rowIDSQL = "SELECT last_insert_rowid() AS n;"
+        return try store.fetchRows(rowIDSQL).first?["n"].flatMap(Int.init) ?? 0
+    }
+
+    private func timestamp() -> String {
+        ISO8601DateFormatter().string(from: Date())
+    }
+
+    private func escape(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "''")
+    }
+}
+
+public struct StoredOperationRecord: Sendable {
+    public var opID: String
+    public var expectedPlanRevision: Int?
+    public var appliedRevision: Int?
+    public var intent: String
+    public var status: String
+    public var payloadJSON: String
+    public var resultJSON: String?
+    public var createdAtUTC: String
+
+    public init(
+        opID: String = UUID().uuidString,
+        expectedPlanRevision: Int?,
+        appliedRevision: Int?,
+        intent: String,
+        status: String,
+        payloadJSON: String,
+        resultJSON: String? = nil,
+        createdAtUTC: String = ISO8601DateFormatter().string(from: Date())
+    ) {
+        self.opID = opID
+        self.expectedPlanRevision = expectedPlanRevision
+        self.appliedRevision = appliedRevision
+        self.intent = intent
+        self.status = status
+        self.payloadJSON = payloadJSON
+        self.resultJSON = resultJSON
+        self.createdAtUTC = createdAtUTC
+    }
+}
+
+public final class OperationRepository {
+    private let store: SQLiteStore
+
+    public init(store: SQLiteStore) {
+        self.store = store
+    }
+
+    public func latestAppliedRevision() throws -> Int {
+        let sql = "SELECT COALESCE(MAX(applied_revision), 0) AS n FROM operations WHERE applied_revision IS NOT NULL;"
+        return try store.fetchRows(sql).first?["n"].flatMap(Int.init) ?? 0
+    }
+
+    public func insert(_ record: StoredOperationRecord) throws {
+        let expectedSQL = record.expectedPlanRevision.map(String.init) ?? "NULL"
+        let appliedSQL = record.appliedRevision.map(String.init) ?? "NULL"
+        let resultSQL = record.resultJSON.map { "'\(escape($0))'" } ?? "NULL"
+
+        let sql = """
+        INSERT OR REPLACE INTO operations (
+          op_id, expected_plan_revision, applied_revision, intent, status, payload_json, result_json, created_at_utc
+        ) VALUES (
+          '\(escape(record.opID))',
+          \(expectedSQL),
+          \(appliedSQL),
+          '\(escape(record.intent))',
+          '\(escape(record.status))',
+          '\(escape(record.payloadJSON))',
+          \(resultSQL),
+          '\(escape(record.createdAtUTC))'
+        );
+        """
+        try store.execute(sql)
+    }
+
+    public func latestUndoableOperation() throws -> StoredOperationRecord? {
+        let sql = """
+        SELECT op_id, expected_plan_revision, applied_revision, intent, status, payload_json, result_json, created_at_utc
+        FROM operations
+        WHERE status = 'applied'
+          AND intent IN ('create_block', 'move_block')
+        ORDER BY created_at_utc DESC
+        LIMIT 1;
+        """
+
+        guard let row = try store.fetchRows(sql).first,
+              let opID = row["op_id"],
+              let intent = row["intent"],
+              let status = row["status"],
+              let payload = row["payload_json"],
+              let createdAt = row["created_at_utc"]
+        else {
+            return nil
+        }
+
+        return StoredOperationRecord(
+            opID: opID,
+            expectedPlanRevision: row["expected_plan_revision"].flatMap(Int.init),
+            appliedRevision: row["applied_revision"].flatMap(Int.init),
+            intent: intent,
+            status: status,
+            payloadJSON: payload,
+            resultJSON: row["result_json"],
+            createdAtUTC: createdAt
+        )
+    }
+
+    public func markUndone(opID: String) throws {
+        let sql = """
+        UPDATE operations
+        SET status = 'undone'
+        WHERE op_id = '\(escape(opID))';
+        """
+        try store.execute(sql)
     }
 
     private func escape(_ value: String) -> String {
