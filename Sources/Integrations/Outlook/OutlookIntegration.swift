@@ -1,6 +1,16 @@
 import CoreContracts
 import Foundation
 
+public struct OutlookSyncCursor: Codable, Equatable, Sendable {
+    public var receivedDateTimeISO8601: String
+    public var messageID: String?
+
+    public init(receivedDateTimeISO8601: String, messageID: String? = nil) {
+        self.receivedDateTimeISO8601 = receivedDateTimeISO8601
+        self.messageID = messageID
+    }
+}
+
 public struct OutlookMessage: Sendable {
     public var messageID: String
     public var conversationID: String?
@@ -30,7 +40,7 @@ public struct OutlookMessage: Sendable {
 }
 
 public protocol OutlookClient: Sendable {
-    func fetchMessages(since cursor: String?) async throws -> ([OutlookMessage], nextCursor: String?)
+    func fetchMessages(since cursor: OutlookSyncCursor?) async throws -> ([OutlookMessage], nextCursor: OutlookSyncCursor?)
 }
 
 public enum OutlookClientError: Error, LocalizedError {
@@ -61,52 +71,56 @@ public struct MicrosoftGraphOutlookClient: OutlookClient {
         self.top = max(1, min(top, 100))
     }
 
-    public func fetchMessages(since cursor: String?) async throws -> ([OutlookMessage], nextCursor: String?) {
-        var components = URLComponents(string: "https://graph.microsoft.com/v1.0/me/messages")
-        var queryItems: [URLQueryItem] = [
-            URLQueryItem(name: "$top", value: "\(top)"),
-            URLQueryItem(name: "$orderby", value: "receivedDateTime desc"),
-            URLQueryItem(name: "$select", value: "id,conversationId,receivedDateTime,subject,bodyPreview,body,from")
-        ]
+    public func fetchMessages(since cursor: OutlookSyncCursor?) async throws -> ([OutlookMessage], nextCursor: OutlookSyncCursor?) {
+        var nextPageURL: URL? = try initialPageURL(cursor: cursor)
+        var fetched: [OutlookMessage] = []
+        var seenMessageIDs = Set<String>()
 
-        if let cursor,
-           let cursorDate = ISO8601DateFormatter().date(from: cursor) {
-            let filterISO = ISO8601DateFormatter().string(from: cursorDate)
-            queryItems.append(URLQueryItem(name: "$filter", value: "receivedDateTime gt \(filterISO)"))
-        }
+        while let url = nextPageURL {
+            let data = try await authorizedGET(url)
+            let decoded = try JSONDecoder().decode(OutlookListResponse.self, from: data)
 
-        components?.queryItems = queryItems
-        guard let url = components?.url else {
-            throw OutlookClientError.invalidURL
-        }
+            let pageMessages: [OutlookMessage] = decoded.value.compactMap { item in
+                guard let date = ISO8601DateFormatter().date(from: item.receivedDateTime) else {
+                    return nil
+                }
 
-        let data = try await authorizedGET(url)
-        let decoded = try JSONDecoder().decode(OutlookListResponse.self, from: data)
+                let from = item.from.emailAddress.address
+                let bodyText = stripHTML(item.body?.content ?? item.bodyPreview)
+                let links = extractLinks(from: bodyText)
 
-        let messages: [OutlookMessage] = decoded.value.compactMap { item in
-            guard let date = ISO8601DateFormatter().date(from: item.receivedDateTime) else {
-                return nil
+                return OutlookMessage(
+                    messageID: item.id,
+                    conversationID: item.conversationId,
+                    receivedDateTime: date,
+                    from: from,
+                    subject: item.subject,
+                    bodyText: bodyText,
+                    links: links
+                )
             }
 
-            let from = item.from.emailAddress.address
-            let bodyText = stripHTML(item.body?.content ?? item.bodyPreview)
-            let links = extractLinks(from: bodyText)
+            for message in pageMessages {
+                guard seenMessageIDs.insert(message.messageID).inserted else {
+                    continue
+                }
 
-            return OutlookMessage(
-                messageID: item.id,
-                conversationID: item.conversationId,
-                receivedDateTime: date,
-                from: from,
-                subject: item.subject,
-                bodyText: bodyText,
-                links: links
-            )
+                if isAfterCursor(message, cursor: cursor) {
+                    fetched.append(message)
+                }
+            }
+
+            nextPageURL = decoded.nextLink.flatMap(URL.init(string:))
         }
 
-        let latest = messages.map(\.receivedDateTime).max()
-        let nextCursor = latest.map { ISO8601DateFormatter().string(from: $0) } ?? cursor
+        fetched.sort(by: messageTupleCompare)
 
-        return (messages, nextCursor)
+        var nextCursor = cursor
+        for message in fetched {
+            nextCursor = maxCursor(nextCursor, message: message)
+        }
+
+        return (fetched, nextCursor)
     }
 
     private func authorizedGET(_ url: URL) async throws -> Data {
@@ -125,6 +139,85 @@ public struct MicrosoftGraphOutlookClient: OutlookClient {
         }
 
         return data
+    }
+
+    private func initialPageURL(cursor: OutlookSyncCursor?) throws -> URL {
+        var components = URLComponents(string: "https://graph.microsoft.com/v1.0/me/messages")
+        var queryItems: [URLQueryItem] = [
+            URLQueryItem(name: "$top", value: "\(top)"),
+            URLQueryItem(name: "$orderby", value: "receivedDateTime asc,id asc"),
+            URLQueryItem(name: "$select", value: "id,conversationId,receivedDateTime,subject,bodyPreview,body,from")
+        ]
+
+        if let cursor,
+           let cursorDate = ISO8601DateFormatter().date(from: cursor.receivedDateTimeISO8601) {
+            let filterISO = ISO8601DateFormatter().string(from: cursorDate)
+            // Inclusive lower bound + local tuple filtering avoids missing same-timestamp messages.
+            queryItems.append(URLQueryItem(name: "$filter", value: "receivedDateTime ge \(filterISO)"))
+        }
+
+        components?.queryItems = queryItems
+        guard let url = components?.url else {
+            throw OutlookClientError.invalidURL
+        }
+        return url
+    }
+
+    private func isAfterCursor(_ message: OutlookMessage, cursor: OutlookSyncCursor?) -> Bool {
+        guard let cursor,
+              let cursorDate = ISO8601DateFormatter().date(from: cursor.receivedDateTimeISO8601)
+        else {
+            return true
+        }
+
+        if message.receivedDateTime > cursorDate {
+            return true
+        }
+
+        if message.receivedDateTime < cursorDate {
+            return false
+        }
+
+        return message.messageID > (cursor.messageID ?? "")
+    }
+
+    private func messageTupleCompare(lhs: OutlookMessage, rhs: OutlookMessage) -> Bool {
+        if lhs.receivedDateTime != rhs.receivedDateTime {
+            return lhs.receivedDateTime < rhs.receivedDateTime
+        }
+
+        return lhs.messageID < rhs.messageID
+    }
+
+    private func maxCursor(_ current: OutlookSyncCursor?, message: OutlookMessage) -> OutlookSyncCursor {
+        let candidate = OutlookSyncCursor(
+            receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+            messageID: message.messageID
+        )
+
+        guard let current else {
+            return candidate
+        }
+
+        guard let currentDate = ISO8601DateFormatter().date(from: current.receivedDateTimeISO8601),
+              let candidateDate = ISO8601DateFormatter().date(from: candidate.receivedDateTimeISO8601)
+        else {
+            return candidate
+        }
+
+        if candidateDate > currentDate {
+            return candidate
+        }
+
+        if candidateDate < currentDate {
+            return current
+        }
+
+        if (candidate.messageID ?? "") > (current.messageID ?? "") {
+            return candidate
+        }
+
+        return current
     }
 
     private func stripHTML(_ html: String) -> String {
@@ -152,13 +245,13 @@ public struct MicrosoftGraphOutlookClient: OutlookClient {
 }
 
 public struct StubOutlookClient: OutlookClient {
-    private let pages: [(cursor: String?, messages: [OutlookMessage], nextCursor: String?)]
+    private let pages: [(cursor: OutlookSyncCursor?, messages: [OutlookMessage], nextCursor: OutlookSyncCursor?)]
 
-    public init(pages: [(cursor: String?, messages: [OutlookMessage], nextCursor: String?)] = []) {
+    public init(pages: [(cursor: OutlookSyncCursor?, messages: [OutlookMessage], nextCursor: OutlookSyncCursor?)] = []) {
         self.pages = pages
     }
 
-    public func fetchMessages(since cursor: String?) async throws -> ([OutlookMessage], nextCursor: String?) {
+    public func fetchMessages(since cursor: OutlookSyncCursor?) async throws -> ([OutlookMessage], nextCursor: OutlookSyncCursor?) {
         if let page = pages.first(where: { $0.cursor == cursor }) {
             return (page.messages, page.nextCursor)
         }
@@ -191,4 +284,10 @@ private struct OutlookListResponse: Decodable {
     }
 
     let value: [Item]
+    let nextLink: String?
+
+    enum CodingKeys: String, CodingKey {
+        case value
+        case nextLink = "@odata.nextLink"
+    }
 }

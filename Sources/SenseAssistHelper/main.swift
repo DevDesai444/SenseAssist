@@ -15,26 +15,26 @@ import Storage
 
 @main
 struct SenseAssistHelperMain {
-    private static let defaultMultiAccounts: [ConnectedEmailAccount] = [
+    private static let demoMultiAccounts: [ConnectedEmailAccount] = [
         ConnectedEmailAccount(
-            accountID: "gmail:devdesaiyt@gmail.com",
+            accountID: "gmail:demo.student.one@example.com",
             provider: .gmail,
-            email: "devdesaiyt@gmail.com"
+            email: "demo.student.one@example.com"
         ),
         ConnectedEmailAccount(
-            accountID: "gmail:devdesaiofficial@gmail.com",
+            accountID: "gmail:demo.student.two@example.com",
             provider: .gmail,
-            email: "devdesaiofficial@gmail.com"
+            email: "demo.student.two@example.com"
         ),
         ConnectedEmailAccount(
-            accountID: "gmail:devdesaiyttt@gmail.com",
+            accountID: "gmail:demo.student.three@example.com",
             provider: .gmail,
-            email: "devdesaiyttt@gmail.com"
+            email: "demo.student.three@example.com"
         ),
         ConnectedEmailAccount(
-            accountID: "outlook:devchira@buffalo.edu",
+            accountID: "outlook:demo.student@university.example",
             provider: .outlook,
-            email: "devchira@buffalo.edu"
+            email: "demo.student@university.example"
         )
     ]
 
@@ -42,8 +42,11 @@ struct SenseAssistHelperMain {
         let logger = ConsoleLogger(minimumLevel: .info)
 
         do {
-            let home = ProcessInfo.processInfo.environment["HOME"] ?? FileManager.default.currentDirectoryPath
+            let environment = ProcessInfo.processInfo.environment
+            let arguments = ProcessInfo.processInfo.arguments
+            let home = environment["HOME"] ?? FileManager.default.currentDirectoryPath
             let config = SenseAssistConfiguration.default(homeDirectory: home)
+            let demoModeEnabled = environment["SENSEASSIST_ENABLE_DEMO_COMMANDS"] == "1" || arguments.contains("--allow-demo")
 
             let bootstrap = try StorageBootstrap.run(config: config, logger: logger)
             guard bootstrap.healthy else {
@@ -51,26 +54,31 @@ struct SenseAssistHelperMain {
                 Foundation.exit(1)
             }
 
-            if ProcessInfo.processInfo.arguments.contains("--health-check") {
+            if arguments.contains("--health-check") {
                 logger.log(.info, "health=ok db=\(bootstrap.databasePath)", category: "helper")
                 Foundation.exit(0)
             }
 
-            if let command = extractPlanCommand(arguments: ProcessInfo.processInfo.arguments) {
-                let auditStore = SQLiteStore(databasePath: config.databasePath, logger: logger)
-                try auditStore.initialize()
-                let auditRepository = AuditLogRepository(store: auditStore)
+            if let command = extractPlanCommand(arguments: arguments) {
+                let commandStore = SQLiteStore(databasePath: config.databasePath, logger: logger)
+                try commandStore.initialize()
+                let auditRepository = AuditLogRepository(store: commandStore)
+                let operationRepository = OperationRepository(store: commandStore)
+                let planRevisionRepository = PlanRevisionRepository(store: commandStore)
 
                 let service = PlanCommandService(
                     calendarStore: EventKitService(),
-                    auditLogRepository: auditRepository
+                    auditLogRepository: auditRepository,
+                    operationRepository: operationRepository,
+                    planRevisionRepository: planRevisionRepository
                 )
                 let response = await service.handle(commandText: command, now: Date())
                 print(response.text)
                 Foundation.exit(response.requiresConfirmation ? 2 : 0)
             }
 
-            if ProcessInfo.processInfo.arguments.contains("--gmail-sync-demo") {
+            if arguments.contains("--gmail-sync-demo") {
+                guard demoModeEnabled else { throw LiveSyncError.demoModeDisabled }
                 let summary = try await runGmailSyncDemo(config: config, logger: logger)
                 print(
                     "Gmail sync summary: account=\(summary.accountEmail) fetched=\(summary.fetchedMessages) parsed=\(summary.parsedUpdates) stored_updates=\(summary.storedUpdates) tasks=\(summary.createdOrUpdatedTasks) next_cursor=\(summary.nextCursor ?? "nil")"
@@ -78,7 +86,8 @@ struct SenseAssistHelperMain {
                 Foundation.exit(0)
             }
 
-            if ProcessInfo.processInfo.arguments.contains("--outlook-sync-demo") {
+            if arguments.contains("--outlook-sync-demo") {
+                guard demoModeEnabled else { throw LiveSyncError.demoModeDisabled }
                 let summary = try await runOutlookSyncDemo(config: config, logger: logger)
                 print(
                     "Outlook sync summary: account=\(summary.accountEmail) fetched=\(summary.fetchedMessages) parsed=\(summary.parsedUpdates) stored_updates=\(summary.storedUpdates) tasks=\(summary.createdOrUpdatedTasks) next_cursor=\(summary.nextCursor ?? "nil")"
@@ -86,25 +95,54 @@ struct SenseAssistHelperMain {
                 Foundation.exit(0)
             }
 
-            if ProcessInfo.processInfo.arguments.contains("--sync-all-demo") {
+            if arguments.contains("--sync-all-demo") {
+                guard demoModeEnabled else { throw LiveSyncError.demoModeDisabled }
                 let report = try await runMultiAccountSyncDemo(config: config, logger: logger)
                 print(report)
                 Foundation.exit(0)
             }
 
-            if ProcessInfo.processInfo.arguments.contains("--sync-live-once") {
+            if arguments.contains("--sync-live-once") {
                 let report = try await runMultiAccountSyncLive(config: config, logger: logger)
-                print(report)
+                print(report.report)
                 Foundation.exit(0)
             }
 
             logger.log(.info, "SenseAssist helper initialized", category: "helper")
 
-            // Minimal runtime loop for Milestone 1 scaffolding.
-            while true {
-                try await Task.sleep(for: .seconds(config.sync.normalPollingMinutes * 60))
-                logger.log(.debug, "heartbeat", category: "helper")
+            let runtimeStore = SQLiteStore(databasePath: config.databasePath, logger: logger)
+            try runtimeStore.initialize()
+            let runtimeAuditRepository = AuditLogRepository(store: runtimeStore)
+            let runtimeOperationRepository = OperationRepository(store: runtimeStore)
+            let runtimePlanRevisionRepository = PlanRevisionRepository(store: runtimeStore)
+            let runtimePlanService = PlanCommandService(
+                calendarStore: EventKitService(),
+                auditLogRepository: runtimeAuditRepository,
+                operationRepository: runtimeOperationRepository,
+                planRevisionRepository: runtimePlanRevisionRepository
+            )
+
+            var connectedSlackClient: SlackWebAPIClient?
+            if let botToken = environment["SENSEASSIST_SLACK_BOT_TOKEN"], !botToken.isEmpty,
+               let appToken = environment["SENSEASSIST_SLACK_APP_TOKEN"], !appToken.isEmpty {
+                let slackClient = SlackWebAPIClient(botToken: botToken, appLevelToken: appToken)
+                await slackClient.setCommandHandler { command in
+                    let response = await runtimePlanService.handle(commandText: command.text, now: Date())
+                    return response.text
+                }
+                try await slackClient.connect()
+                connectedSlackClient = slackClient
+                logger.log(.info, "Slack Socket Mode connected", category: "slack")
+            } else {
+                logger.log(
+                    .warning,
+                    "Slack tokens are not configured. Set SENSEASSIST_SLACK_BOT_TOKEN and SENSEASSIST_SLACK_APP_TOKEN for runtime command routing.",
+                    category: "slack"
+                )
             }
+
+            _ = connectedSlackClient
+            try await runBackgroundSyncLoop(config: config, logger: logger)
         } catch {
             fputs("Helper failed: \(error.localizedDescription)\n", stderr)
             Foundation.exit(1)
@@ -145,8 +183,25 @@ struct SenseAssistHelperMain {
 
         let client = StubGmailClient(
             pages: [
-                (cursor: nil, messages: [sampleMessage], nextCursor: "demo-cursor-v1"),
-                (cursor: "demo-cursor-v1", messages: [], nextCursor: "demo-cursor-v1")
+                (
+                    cursor: nil,
+                    messages: [sampleMessage],
+                    nextCursor: GmailSyncCursor(
+                        internalDateSeconds: Int(sampleMessage.internalDate.timeIntervalSince1970),
+                        messageID: sampleMessage.messageID
+                    )
+                ),
+                (
+                    cursor: GmailSyncCursor(
+                        internalDateSeconds: Int(sampleMessage.internalDate.timeIntervalSince1970),
+                        messageID: sampleMessage.messageID
+                    ),
+                    messages: [],
+                    nextCursor: GmailSyncCursor(
+                        internalDateSeconds: Int(sampleMessage.internalDate.timeIntervalSince1970),
+                        messageID: sampleMessage.messageID
+                    )
+                )
             ]
         )
         let service = GmailIngestionService(
@@ -186,8 +241,25 @@ struct SenseAssistHelperMain {
 
         let client = StubOutlookClient(
             pages: [
-                (cursor: nil, messages: [sampleMessage], nextCursor: "outlook-cursor-v1"),
-                (cursor: "outlook-cursor-v1", messages: [], nextCursor: "outlook-cursor-v1")
+                (
+                    cursor: nil,
+                    messages: [sampleMessage],
+                    nextCursor: OutlookSyncCursor(
+                        receivedDateTimeISO8601: ISO8601DateFormatter().string(from: sampleMessage.receivedDateTime),
+                        messageID: sampleMessage.messageID
+                    )
+                ),
+                (
+                    cursor: OutlookSyncCursor(
+                        receivedDateTimeISO8601: ISO8601DateFormatter().string(from: sampleMessage.receivedDateTime),
+                        messageID: sampleMessage.messageID
+                    ),
+                    messages: [],
+                    nextCursor: OutlookSyncCursor(
+                        receivedDateTimeISO8601: ISO8601DateFormatter().string(from: sampleMessage.receivedDateTime),
+                        messageID: sampleMessage.messageID
+                    )
+                )
             ]
         )
         let service = OutlookIngestionService(
@@ -211,7 +283,7 @@ struct SenseAssistHelperMain {
         try store.initialize()
 
         let accountRepository = AccountRepository(store: store)
-        for account in defaultMultiAccounts {
+        for account in demoMultiAccounts {
             try accountRepository.upsert(account)
         }
 
@@ -240,8 +312,25 @@ struct SenseAssistHelperMain {
                 )
                 return StubGmailClient(
                     pages: [
-                        (cursor: nil, messages: [message], nextCursor: "\(account.accountID)-cursor-v1"),
-                        (cursor: "\(account.accountID)-cursor-v1", messages: [], nextCursor: "\(account.accountID)-cursor-v1")
+                        (
+                            cursor: nil,
+                            messages: [message],
+                            nextCursor: GmailSyncCursor(
+                                internalDateSeconds: Int(message.internalDate.timeIntervalSince1970),
+                                messageID: message.messageID
+                            )
+                        ),
+                        (
+                            cursor: GmailSyncCursor(
+                                internalDateSeconds: Int(message.internalDate.timeIntervalSince1970),
+                                messageID: message.messageID
+                            ),
+                            messages: [],
+                            nextCursor: GmailSyncCursor(
+                                internalDateSeconds: Int(message.internalDate.timeIntervalSince1970),
+                                messageID: message.messageID
+                            )
+                        )
                     ]
                 )
             },
@@ -258,8 +347,25 @@ struct SenseAssistHelperMain {
                 )
                 return StubOutlookClient(
                     pages: [
-                        (cursor: nil, messages: [message], nextCursor: "\(account.accountID)-cursor-v1"),
-                        (cursor: "\(account.accountID)-cursor-v1", messages: [], nextCursor: "\(account.accountID)-cursor-v1")
+                        (
+                            cursor: nil,
+                            messages: [message],
+                            nextCursor: OutlookSyncCursor(
+                                receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+                                messageID: message.messageID
+                            )
+                        ),
+                        (
+                            cursor: OutlookSyncCursor(
+                                receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+                                messageID: message.messageID
+                            ),
+                            messages: [],
+                            nextCursor: OutlookSyncCursor(
+                                receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+                                messageID: message.messageID
+                            )
+                        )
                     ]
                 )
             }
@@ -289,20 +395,41 @@ struct SenseAssistHelperMain {
         return lines.joined(separator: "\n")
     }
 
-    private static func runMultiAccountSyncLive(config: SenseAssistConfiguration, logger: Logging) async throws -> String {
+    private static func runBackgroundSyncLoop(config: SenseAssistConfiguration, logger: Logging) async throws {
+        var syncState: SyncState = .normal
+        var retryCount = 0
+
+        while true {
+            let seed = Int(Date().timeIntervalSince1970)
+            let interval = AdaptiveSyncScheduler.nextInterval(for: syncState, config: config.sync, seed: seed)
+            let sleepSeconds = (interval.delayMinutes * 60) + interval.jitterSeconds
+            try await Task.sleep(for: .seconds(sleepSeconds))
+
+            do {
+                let report = try await runMultiAccountSyncLive(config: config, logger: logger)
+                logger.log(.info, report.report, category: "sync")
+                retryCount = 0
+                syncState = report.totalFetched > 0 ? .active : .idle
+            } catch {
+                retryCount += 1
+                syncState = .error(retryCount: retryCount)
+                logger.log(.warning, "background_sync_failed: \(error.localizedDescription)", category: "sync")
+            }
+        }
+    }
+
+    private struct LiveSyncExecutionResult: Sendable {
+        let report: String
+        let totalFetched: Int
+    }
+
+    private static func runMultiAccountSyncLive(config: SenseAssistConfiguration, logger: Logging) async throws -> LiveSyncExecutionResult {
         let store = SQLiteStore(databasePath: config.databasePath, logger: logger)
         try store.initialize()
         defer { store.close() }
 
         let accountRepository = AccountRepository(store: store)
-        var enabledAccounts = try accountRepository.list(enabledOnly: true)
-
-        if enabledAccounts.isEmpty {
-            for account in defaultMultiAccounts {
-                try accountRepository.upsert(account)
-            }
-            enabledAccounts = try accountRepository.list(enabledOnly: true)
-        }
+        let enabledAccounts = try accountRepository.list(enabledOnly: true)
 
         guard !enabledAccounts.isEmpty else {
             throw LiveSyncError.noEnabledAccounts
@@ -311,8 +438,10 @@ struct SenseAssistHelperMain {
         let cursorRepository = ProviderCursorRepository(store: store)
         let updateRepository = UpdateRepository(store: store)
         let taskRepository = TaskRepository(store: store)
+        let planRevisionRepository = PlanRevisionRepository(store: store)
+        let operationRepository = OperationRepository(store: store)
         let credentialStore = ChainedCredentialStore(stores: [KeychainCredentialStore(), EnvironmentCredentialStore()])
-        let llmRuntime = configuredLLMRuntime()
+        let llmRuntime = try configuredLLMRuntime()
 
         var gmailTokens: [String: String] = [:]
         var outlookTokens: [String: String] = [:]
@@ -349,6 +478,23 @@ struct SenseAssistHelperMain {
             throw LiveSyncError.noCredentialsConfigured
         }
 
+        let eventKitService = EventKitService()
+        let permissionState = await eventKitService.currentPermissionState()
+        let autoPlanningService: AutoPlanningService?
+        switch permissionState {
+        case .fullAccess, .writeOnly:
+            autoPlanningService = AutoPlanningService(
+                taskRepository: taskRepository,
+                planRevisionRepository: planRevisionRepository,
+                operationRepository: operationRepository,
+                calendarStore: eventKitService,
+                managedCalendarName: "SenseAssist",
+                constraints: config.constraints
+            )
+        default:
+            autoPlanningService = nil
+        }
+
         let coordinator = MultiAccountSyncCoordinator(
             accountRepository: accountRepository,
             cursorRepository: cursorRepository,
@@ -367,7 +513,8 @@ struct SenseAssistHelperMain {
                     return nil
                 }
                 return MicrosoftGraphOutlookClient(accessToken: token)
-            }
+            },
+            autoPlanningService: autoPlanningService
         )
 
         let result = try await coordinator.syncAllEnabledAccounts()
@@ -391,35 +538,36 @@ struct SenseAssistHelperMain {
             "totals: fetched=\(result.totalFetched) updates=\(totalUpdates) tasks=\(totalTasks) enabled_accounts=\(enabledAccounts.count)"
         )
 
-        return lines.joined(separator: "\n")
+        return LiveSyncExecutionResult(report: lines.joined(separator: "\n"), totalFetched: result.totalFetched)
     }
 
-    private static func configuredLLMRuntime() -> LLMRuntimeClient {
+    private static func configuredLLMRuntime() throws -> LLMRuntimeClient {
         let environment = ProcessInfo.processInfo.environment
 
-        if let onnxModelPath = environment["SENSEASSIST_ONNX_MODEL_PATH"], !onnxModelPath.isEmpty {
-            let runnerPath = environment["SENSEASSIST_ONNX_RUNNER"] ?? "Scripts/onnx_genai_runner.py"
-            let pythonPath = environment["SENSEASSIST_ONNX_PYTHON"] ?? "/usr/bin/python3"
-            let maxNewTokens = Int(environment["SENSEASSIST_ONNX_MAX_NEW_TOKENS"] ?? "") ?? 512
-            let temperature = Double(environment["SENSEASSIST_ONNX_TEMPERATURE"] ?? "") ?? 0.2
-            let topP = Double(environment["SENSEASSIST_ONNX_TOP_P"] ?? "") ?? 0.95
-            let provider = environment["SENSEASSIST_ONNX_PROVIDER"]
-
-            return ONNXGenAILLMRuntime(
-                modelPath: onnxModelPath,
-                runnerScriptPath: runnerPath,
-                pythonExecutable: pythonPath,
-                maxNewTokens: maxNewTokens,
-                temperature: temperature,
-                topP: topP,
-                provider: provider
-            )
+        guard let onnxModelPath = environment["SENSEASSIST_ONNX_MODEL_PATH"], !onnxModelPath.isEmpty else {
+            throw LiveSyncError.onDeviceLLMNotConfigured
         }
 
-        let model = environment["SENSEASSIST_OLLAMA_MODEL"] ?? "llama3.1:8b"
-        let endpoint = URL(string: environment["SENSEASSIST_OLLAMA_ENDPOINT"] ?? "http://127.0.0.1:11434") ??
-            URL(string: "http://127.0.0.1:11434")!
-        return OllamaLLMRuntime(endpointURL: endpoint, model: model)
+        let runnerPath = environment["SENSEASSIST_ONNX_RUNNER"] ?? "Scripts/onnx_genai_runner.py"
+        guard FileManager.default.fileExists(atPath: runnerPath) else {
+            throw LiveSyncError.onDeviceLLMRunnerMissing(path: runnerPath)
+        }
+
+        let pythonPath = environment["SENSEASSIST_ONNX_PYTHON"] ?? "/usr/bin/python3"
+        let maxNewTokens = Int(environment["SENSEASSIST_ONNX_MAX_NEW_TOKENS"] ?? "") ?? 512
+        let temperature = Double(environment["SENSEASSIST_ONNX_TEMPERATURE"] ?? "") ?? 0.2
+        let topP = Double(environment["SENSEASSIST_ONNX_TOP_P"] ?? "") ?? 0.95
+        let provider = environment["SENSEASSIST_ONNX_PROVIDER"]
+
+        return ONNXGenAILLMRuntime(
+            modelPath: onnxModelPath,
+            runnerScriptPath: runnerPath,
+            pythonExecutable: pythonPath,
+            maxNewTokens: maxNewTokens,
+            temperature: temperature,
+            topP: topP,
+            provider: provider
+        )
     }
 
     private static func loadCredential(
@@ -443,6 +591,9 @@ struct SenseAssistHelperMain {
 private enum LiveSyncError: Error, LocalizedError {
     case noEnabledAccounts
     case noCredentialsConfigured
+    case demoModeDisabled
+    case onDeviceLLMNotConfigured
+    case onDeviceLLMRunnerMissing(path: String)
 
     var errorDescription: String? {
         switch self {
@@ -450,6 +601,12 @@ private enum LiveSyncError: Error, LocalizedError {
             return "No enabled Gmail/Outlook accounts are configured."
         case .noCredentialsConfigured:
             return "No OAuth tokens found for enabled accounts. Configure tokens in Keychain or environment variables."
+        case .demoModeDisabled:
+            return "Demo commands are disabled. Set SENSEASSIST_ENABLE_DEMO_COMMANDS=1 or pass --allow-demo."
+        case .onDeviceLLMNotConfigured:
+            return "On-device LLM is required. Set SENSEASSIST_ONNX_MODEL_PATH to a local ONNX Runtime GenAI model path."
+        case let .onDeviceLLMRunnerMissing(path):
+            return "ONNX runner script not found at \(path). Set SENSEASSIST_ONNX_RUNNER to a valid local runner script."
         }
     }
 }

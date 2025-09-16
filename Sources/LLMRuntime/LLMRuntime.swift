@@ -89,8 +89,10 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         Return ONLY valid JSON array matching this schema exactly:
         [
           {
+            "source_message_id": "string",
             "title": "string",
             "category": "assignment|quiz|email_reply|application|leetcode|project|admin",
+            "due_at_local": "ISO-8601 datetime string or null",
             "estimated_minutes": number,
             "min_daily_minutes": number,
             "priority": number,
@@ -107,21 +109,29 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         let raw = try generate(prompt: prompt)
         let json = try extractJSONArray(from: raw)
         let decoded = try JSONDecoder().decode([ExtractedTaskPayload].self, from: Data(json.utf8))
+        let updateByMessageID = Dictionary(uniqueKeysWithValues: updates.map { ($0.providerIDs.messageID, $0) })
 
-        return decoded.map { payload in
-            let source = updates.first.map(\.source) ?? .gmail
-            let accountID = updates.first.map(\.accountID) ?? "default"
-            let messageID = updates.first?.providerIDs.messageID ?? "unknown"
+        return decoded.compactMap { payload in
+            guard let sourceUpdate = payload.sourceMessageID.flatMap({ updateByMessageID[$0] }) ?? updates.first else {
+                return nil
+            }
 
             return TaskItem(
                 title: payload.title,
                 category: payload.category,
-                dueAtLocal: nil,
+                dueAtLocal: parseDueDate(payload.dueAtLocal),
                 estimatedMinutes: max(15, payload.estimatedMinutes),
                 minDailyMinutes: max(15, payload.minDailyMinutes),
                 priority: max(1, payload.priority),
                 stressWeight: min(max(payload.stressWeight, 0.0), 1.0),
-                sources: [TaskSource(source: source, accountID: accountID, messageID: messageID, confidence: 0.85)],
+                sources: [
+                    TaskSource(
+                        source: sourceUpdate.source,
+                        accountID: sourceUpdate.accountID,
+                        messageID: sourceUpdate.providerIDs.messageID,
+                        confidence: 0.85
+                    )
+                ],
                 status: payload.status
             )
         }
@@ -249,6 +259,29 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         }
         return String(text[start...end])
     }
+
+    private func parseDueDate(_ value: String?) -> Date? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let iso = ISO8601DateFormatter()
+        if let date = iso.date(from: value) {
+            return date
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        for format in ["yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: value) {
+                return date
+            }
+        }
+
+        return nil
+    }
 }
 
 public struct OllamaLLMRuntime: LLMRuntimeClient {
@@ -283,8 +316,10 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
         Return ONLY valid JSON array matching this schema exactly:
         [
           {
+            "source_message_id": "string",
             "title": "string",
             "category": "assignment|quiz|email_reply|application|leetcode|project|admin",
+            "due_at_local": "ISO-8601 datetime string or null",
             "estimated_minutes": number,
             "min_daily_minutes": number,
             "priority": number,
@@ -302,21 +337,29 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
         let json = try extractJSONArray(from: raw)
 
         let decoded = try JSONDecoder().decode([ExtractedTaskPayload].self, from: Data(json.utf8))
+        let updateByMessageID = Dictionary(uniqueKeysWithValues: updates.map { ($0.providerIDs.messageID, $0) })
 
-        return decoded.map { payload in
-            let source = updates.first.map(\.source) ?? .gmail
-            let accountID = updates.first.map(\.accountID) ?? "default"
-            let messageID = updates.first?.providerIDs.messageID ?? "unknown"
+        return decoded.compactMap { payload in
+            guard let sourceUpdate = payload.sourceMessageID.flatMap({ updateByMessageID[$0] }) ?? updates.first else {
+                return nil
+            }
 
             return TaskItem(
                 title: payload.title,
                 category: payload.category,
-                dueAtLocal: nil,
+                dueAtLocal: parseDueDate(payload.dueAtLocal),
                 estimatedMinutes: max(15, payload.estimatedMinutes),
                 minDailyMinutes: max(15, payload.minDailyMinutes),
                 priority: max(1, payload.priority),
                 stressWeight: min(max(payload.stressWeight, 0.0), 1.0),
-                sources: [TaskSource(source: source, accountID: accountID, messageID: messageID, confidence: 0.85)],
+                sources: [
+                    TaskSource(
+                        source: sourceUpdate.source,
+                        accountID: sourceUpdate.accountID,
+                        messageID: sourceUpdate.providerIDs.messageID,
+                        confidence: 0.85
+                    )
+                ],
                 status: payload.status
             )
         }
@@ -409,6 +452,29 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
         }
         return String(text[start...end])
     }
+
+    private func parseDueDate(_ value: String?) -> Date? {
+        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+            return nil
+        }
+
+        let iso = ISO8601DateFormatter()
+        if let date = iso.date(from: value) {
+            return date
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        for format in ["yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
+            formatter.dateFormat = format
+            if let date = formatter.date(from: value) {
+                return date
+            }
+        }
+
+        return nil
+    }
 }
 
 public struct StubLLMRuntime: LLMRuntimeClient {
@@ -419,7 +485,7 @@ public struct StubLLMRuntime: LLMRuntimeClient {
             TaskItem(
                 title: update.subject,
                 category: .assignment,
-                dueAtLocal: nil,
+                dueAtLocal: extractDueDate(from: "\(update.subject)\n\(update.bodyText)"),
                 estimatedMinutes: 60,
                 minDailyMinutes: 30,
                 priority: 1,
@@ -462,6 +528,37 @@ public struct StubLLMRuntime: LLMRuntimeClient {
 
         throw LLMRuntimeError.unsupportedPrompt
     }
+
+    private func extractDueDate(from text: String) -> Date? {
+        let pattern = #"(jan|feb|mar|apr|may|jun|jul|aug|sep|oct|nov|dec)[a-z]*\s+(\d{1,2})(,\s*(\d{4}))?"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: [.caseInsensitive]) else {
+            return nil
+        }
+
+        let range = NSRange(text.startIndex..<text.endIndex, in: text)
+        guard let match = regex.firstMatch(in: text, options: [], range: range),
+              let monthRange = Range(match.range(at: 1), in: text),
+              let dayRange = Range(match.range(at: 2), in: text)
+        else {
+            return nil
+        }
+
+        let month = String(text[monthRange])
+        let day = String(text[dayRange])
+        let year: String
+        if match.range(at: 4).location != NSNotFound,
+           let yearRange = Range(match.range(at: 4), in: text) {
+            year = String(text[yearRange])
+        } else {
+            year = String(Calendar.current.component(.year, from: Date()))
+        }
+
+        let formatter = DateFormatter()
+        formatter.locale = Locale(identifier: "en_US_POSIX")
+        formatter.timeZone = TimeZone.current
+        formatter.dateFormat = "MMM d yyyy"
+        return formatter.date(from: "\(month) \(day) \(year)")
+    }
 }
 
 private struct OllamaGenerateRequest: Encodable {
@@ -497,8 +594,10 @@ private struct ONNXRunnerResponse: Decodable {
 }
 
 private struct ExtractedTaskPayload: Decodable {
+    let sourceMessageID: String?
     let title: String
     let category: TaskCategory
+    let dueAtLocal: String?
     let estimatedMinutes: Int
     let minDailyMinutes: Int
     let priority: Int
@@ -506,8 +605,10 @@ private struct ExtractedTaskPayload: Decodable {
     let status: TaskStatus
 
     enum CodingKeys: String, CodingKey {
+        case sourceMessageID = "source_message_id"
         case title
         case category
+        case dueAtLocal = "due_at_local"
         case estimatedMinutes = "estimated_minutes"
         case minDailyMinutes = "min_daily_minutes"
         case priority

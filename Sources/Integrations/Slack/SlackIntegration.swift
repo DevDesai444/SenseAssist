@@ -13,6 +13,8 @@ public struct SlackCommand: Sendable {
     }
 }
 
+public typealias SlackCommandHandler = @Sendable (SlackCommand) async -> String?
+
 public protocol SlackSocketClient: Sendable {
     func connect() async throws
     func disconnect() async
@@ -41,11 +43,15 @@ public actor SlackWebAPIClient: SlackSocketClient {
     private let appLevelToken: String?
     private let session: URLSession
     private var socketTask: URLSessionWebSocketTask?
+    private var commandHandler: SlackCommandHandler?
+    private var reconnectAttempts: Int
+    private var reconnectTask: Task<Void, Never>?
 
     public init(botToken: String, appLevelToken: String? = nil, session: URLSession = .shared) {
         self.botToken = botToken
         self.appLevelToken = appLevelToken
         self.session = session
+        self.reconnectAttempts = 0
     }
 
     public func connect() async throws {
@@ -70,13 +76,21 @@ public actor SlackWebAPIClient: SlackSocketClient {
             throw SlackClientError.socketURLUnavailable
         }
 
+        socketTask?.cancel(with: .goingAway, reason: nil)
         let socket = session.webSocketTask(with: url)
         socket.resume()
         self.socketTask = socket
+        reconnectAttempts = 0
         receiveLoop()
     }
 
+    public func setCommandHandler(_ handler: @escaping SlackCommandHandler) {
+        self.commandHandler = handler
+    }
+
     public func disconnect() async {
+        reconnectTask?.cancel()
+        reconnectTask = nil
         socketTask?.cancel(with: .goingAway, reason: nil)
         socketTask = nil
     }
@@ -107,14 +121,25 @@ public actor SlackWebAPIClient: SlackSocketClient {
         guard let socketTask else { return }
 
         socketTask.receive { [weak self] result in
-            guard let self else { return }
-            Task { await self.handleSocketMessage(result) }
-            Task { await self.receiveLoop() }
+            Task {
+                guard let self else { return }
+                await self.handleSocketReceive(result)
+            }
         }
     }
 
-    private func handleSocketMessage(_ result: Result<URLSessionWebSocketTask.Message, Error>) async {
-        guard case let .success(message) = result else { return }
+    private func handleSocketReceive(_ result: Result<URLSessionWebSocketTask.Message, Error>) async {
+        guard case let .success(message) = result else {
+            await scheduleReconnect()
+            return
+        }
+
+        reconnectAttempts = 0
+        await handleSocketMessage(message)
+        receiveLoop()
+    }
+
+    private func handleSocketMessage(_ message: URLSessionWebSocketTask.Message) async {
         let payloadData: Data?
         switch message {
         case let .string(text):
@@ -136,6 +161,8 @@ public actor SlackWebAPIClient: SlackSocketClient {
         } catch {
             // Ignore ack failures; reconnect strategy handled externally.
         }
+
+        await routePlanCommand(payload: envelope.payload)
     }
 
     private func sendSocketAck(envelopeID: String) async throws {
@@ -144,6 +171,55 @@ public actor SlackWebAPIClient: SlackSocketClient {
         let data = try JSONEncoder().encode(ack)
         let text = String(data: data, encoding: .utf8) ?? "{\"envelope_id\":\"\(envelopeID)\"}"
         try await socketTask.send(.string(text))
+    }
+
+    private func routePlanCommand(payload: SocketEnvelope.Payload?) async {
+        guard let payload,
+              payload.command == "/plan",
+              let channelID = payload.channelID,
+              let commandHandler
+        else {
+            return
+        }
+
+        let command = SlackCommand(
+            userID: payload.userID ?? "unknown",
+            channelID: channelID,
+            text: payload.text ?? ""
+        )
+
+        guard let responseText = await commandHandler(command), !responseText.isEmpty else {
+            return
+        }
+
+        try? await sendMessage(responseText, channelID: channelID)
+    }
+
+    private func scheduleReconnect() async {
+        guard appLevelToken != nil else {
+            return
+        }
+
+        guard reconnectTask == nil else {
+            return
+        }
+
+        reconnectAttempts += 1
+        let delaySeconds = min(60, Int(pow(2.0, Double(min(reconnectAttempts, 6)))))
+        reconnectTask = Task { [weak self] in
+            try? await Task.sleep(for: .seconds(delaySeconds))
+            guard let self else { return }
+            await self.performReconnect()
+        }
+    }
+
+    private func performReconnect() async {
+        reconnectTask = nil
+        do {
+            try await connect()
+        } catch {
+            await scheduleReconnect()
+        }
     }
 }
 
@@ -181,10 +257,28 @@ private struct SocketOpenResponse: Decodable {
 }
 
 private struct SocketEnvelope: Decodable {
+    struct Payload: Decodable {
+        let type: String?
+        let command: String?
+        let text: String?
+        let channelID: String?
+        let userID: String?
+
+        enum CodingKeys: String, CodingKey {
+            case type
+            case command
+            case text
+            case channelID = "channel_id"
+            case userID = "user_id"
+        }
+    }
+
     let envelopeID: String?
+    let payload: Payload?
 
     enum CodingKeys: String, CodingKey {
         case envelopeID = "envelope_id"
+        case payload
     }
 }
 

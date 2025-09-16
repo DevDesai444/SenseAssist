@@ -23,30 +23,46 @@ public actor PlanCommandService {
         case movedBlock(previous: CalendarBlock)
     }
 
+    private struct PersistedUndoEnvelope: Codable {
+        var kind: String
+        var blockID: String?
+        var ekEventID: String?
+        var previousBlock: CalendarBlock?
+    }
+
     private let calendarStore: CalendarStore
     private let managedCalendarName: String
     private var currentPlanRevision: Int
     private let calendar: Calendar
     private let auditLogRepository: AuditLogRepository?
+    private let operationRepository: OperationRepository?
+    private let planRevisionRepository: PlanRevisionRepository?
     private var undoStack: [UndoOperation]
+    private var hydratedState: Bool
 
     public init(
         calendarStore: CalendarStore,
         managedCalendarName: String = "SenseAssist",
         initialPlanRevision: Int = 1,
         calendar: Calendar = .current,
-        auditLogRepository: AuditLogRepository? = nil
+        auditLogRepository: AuditLogRepository? = nil,
+        operationRepository: OperationRepository? = nil,
+        planRevisionRepository: PlanRevisionRepository? = nil
     ) {
         self.calendarStore = calendarStore
         self.managedCalendarName = managedCalendarName
         self.currentPlanRevision = initialPlanRevision
         self.calendar = calendar
         self.auditLogRepository = auditLogRepository
+        self.operationRepository = operationRepository
+        self.planRevisionRepository = planRevisionRepository
         self.undoStack = []
+        self.hydratedState = false
     }
 
     public func handle(commandText: String, now: Date = Date()) async -> PlanCommandResponse {
         do {
+            hydrateStateIfNeeded()
             audit("info", "command_received", context: ["command_text": commandText])
             try await calendarStore.ensureManagedCalendar(named: managedCalendarName)
             let command = try PlanCommandParser.parse(commandText, now: now, calendar: calendar)
@@ -142,6 +158,20 @@ public actor PlanCommandService {
             let created = try await calendarStore.createManagedBlock(block, calendarName: managedCalendarName)
             undoStack.append(.createdBlock(blockID: created.blockID, ekEventID: created.ekEventID))
             trimUndoStack()
+            persistOperation(
+                expectedRevision: operation.expectedPlanRevision,
+                appliedRevision: currentPlanRevision,
+                intent: operation.intent.rawValue,
+                status: "applied",
+                payload: operation,
+                undoEnvelope: PersistedUndoEnvelope(
+                    kind: "created_block",
+                    blockID: created.blockID.uuidString,
+                    ekEventID: created.ekEventID,
+                    previousBlock: nil
+                )
+            )
+            appendRevision(trigger: "slack_add", summary: PlanSummary(createdBlocks: 1, movedBlocks: 0, deletedBlocks: 0))
             audit(
                 "info",
                 "add_success",
@@ -217,6 +247,20 @@ public actor PlanCommandService {
             _ = try await calendarStore.updateManagedBlock(target, calendarName: managedCalendarName)
             undoStack.append(.movedBlock(previous: original))
             trimUndoStack()
+            persistOperation(
+                expectedRevision: operation.expectedPlanRevision,
+                appliedRevision: currentPlanRevision,
+                intent: operation.intent.rawValue,
+                status: "applied",
+                payload: operation,
+                undoEnvelope: PersistedUndoEnvelope(
+                    kind: "moved_block",
+                    blockID: nil,
+                    ekEventID: nil,
+                    previousBlock: original
+                )
+            )
+            appendRevision(trigger: "slack_move", summary: PlanSummary(createdBlocks: 0, movedBlocks: 1, deletedBlocks: 0))
             audit("info", "move_success", context: ["title": title, "revision": "\(currentPlanRevision)"])
 
             return PlanCommandResponse(
@@ -227,12 +271,21 @@ public actor PlanCommandService {
     }
 
     private func handleUndo() async throws -> PlanCommandResponse {
-        guard let lastOperation = undoStack.popLast() else {
+        var operationToUndo = undoStack.popLast()
+        var persistedUndoOperationID: String?
+
+        if operationToUndo == nil, let persisted = try operationRepository?.latestUndoableOperation() {
+            persistedUndoOperationID = persisted.opID
+            operationToUndo = decodePersistedUndoOperation(from: persisted.resultJSON)
+        }
+
+        guard let lastOperation = operationToUndo else {
             audit("info", "undo_empty", context: ["revision": "\(currentPlanRevision)"])
             return PlanCommandResponse(text: "Nothing to undo.", planRevision: currentPlanRevision)
         }
 
         currentPlanRevision += 1
+        let response: PlanCommandResponse
 
         switch lastOperation {
         case let .createdBlock(blockID, ekEventID):
@@ -242,7 +295,7 @@ public actor PlanCommandService {
                 calendarName: managedCalendarName
             )
             audit("info", "undo_created_block_removed", context: ["revision": "\(currentPlanRevision)"])
-            return PlanCommandResponse(
+            response = PlanCommandResponse(
                 text: "Undo complete: removed last created block. Plan revision: \(currentPlanRevision)",
                 planRevision: currentPlanRevision
             )
@@ -251,11 +304,18 @@ public actor PlanCommandService {
             reverted.planRevision = currentPlanRevision
             _ = try await calendarStore.updateManagedBlock(reverted, calendarName: managedCalendarName)
             audit("info", "undo_move_restored", context: ["revision": "\(currentPlanRevision)"])
-            return PlanCommandResponse(
+            response = PlanCommandResponse(
                 text: "Undo complete: restored previous block timing. Plan revision: \(currentPlanRevision)",
                 planRevision: currentPlanRevision
             )
         }
+
+        if let persistedUndoOperationID {
+            try? operationRepository?.markUndone(opID: persistedUndoOperationID)
+        }
+
+        appendRevision(trigger: "slack_undo", summary: PlanSummary(createdBlocks: 0, movedBlocks: 0, deletedBlocks: 1))
+        return response
     }
 
     private func trimUndoStack(maxEntries: Int = 100) {
@@ -273,5 +333,80 @@ public actor PlanCommandService {
         formatter.timeZone = calendar.timeZone
         formatter.formatOptions = [.withInternetDateTime, .withColonSeparatorInTimeZone]
         return formatter.string(from: date)
+    }
+
+    private func hydrateStateIfNeeded() {
+        guard !hydratedState else {
+            return
+        }
+
+        let persistedRevision = max(
+            (try? planRevisionRepository?.latestRevisionID()) ?? 0,
+            (try? operationRepository?.latestAppliedRevision()) ?? 0
+        )
+        currentPlanRevision = max(currentPlanRevision, persistedRevision)
+        hydratedState = true
+    }
+
+    private func persistOperation(
+        expectedRevision: Int?,
+        appliedRevision: Int?,
+        intent: String,
+        status: String,
+        payload: EditOperation,
+        undoEnvelope: PersistedUndoEnvelope?
+    ) {
+        guard let operationRepository else {
+            return
+        }
+
+        let payloadJSON = encodedJSONString(payload) ?? "{}"
+        let resultJSON = undoEnvelope.flatMap { encodedJSONString($0) }
+        let record = StoredOperationRecord(
+            expectedPlanRevision: expectedRevision,
+            appliedRevision: appliedRevision,
+            intent: intent,
+            status: status,
+            payloadJSON: payloadJSON,
+            resultJSON: resultJSON
+        )
+        try? operationRepository.insert(record)
+    }
+
+    private func appendRevision(trigger: String, summary: PlanSummary) {
+        _ = try? planRevisionRepository?.append(trigger: trigger, summary: summary)
+    }
+
+    private func decodePersistedUndoOperation(from resultJSON: String?) -> UndoOperation? {
+        guard let resultJSON,
+              let data = resultJSON.data(using: .utf8),
+              let envelope = try? JSONDecoder().decode(PersistedUndoEnvelope.self, from: data)
+        else {
+            return nil
+        }
+
+        switch envelope.kind {
+        case "created_block":
+            guard let blockIDRaw = envelope.blockID,
+                  let blockID = UUID(uuidString: blockIDRaw)
+            else {
+                return nil
+            }
+            return .createdBlock(blockID: blockID, ekEventID: envelope.ekEventID)
+        case "moved_block":
+            guard let previous = envelope.previousBlock else {
+                return nil
+            }
+            return .movedBlock(previous: previous)
+        default:
+            return nil
+        }
+    }
+
+    private func encodedJSONString<T: Encodable>(_ value: T) -> String? {
+        guard let data = try? JSONEncoder().encode(value) else {
+            return nil
+        }
+        return String(data: data, encoding: .utf8)
     }
 }
