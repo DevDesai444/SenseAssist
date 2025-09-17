@@ -140,9 +140,8 @@ Implemented and working in this repository:
   - template classification
   - digest splitting
   - confidence and confirmation gating
-- LLM extraction runtime options:
-  - Ollama (default)
-  - ONNX Runtime GenAI bridge (`Scripts/onnx_genai_runner.py`)
+- LLM extraction runtime:
+  - ONNX Runtime GenAI bridge (`Scripts/onnx_genai_runner.py`) is required for live sync.
 - Rules engine for stale revisions, ambiguity, and low-confidence extraction.
 - Planner engine with feasibility states: `on_track`, `at_risk`, `infeasible`.
 - Adaptive background sync scheduler with active/idle/error backoff states.
@@ -275,14 +274,7 @@ make sync-all-live
 
 ## LLM runtime options
 
-### Default: Ollama
-
-```bash
-export SENSEASSIST_OLLAMA_ENDPOINT="http://127.0.0.1:11434"
-export SENSEASSIST_OLLAMA_MODEL="llama3.1:8b"
-```
-
-### ONNX Runtime GenAI
+### Required for live sync: ONNX Runtime GenAI
 
 ```bash
 python3 -m pip install onnxruntime-genai
@@ -307,7 +299,7 @@ export SENSEASSIST_ONNX_TOP_P="0.95"
 - `Sources/ParserPipeline`: deterministic message parsing/classification/splitting.
 - `Sources/RulesEngine`: validation firewall for edits and extracted updates.
 - `Sources/Planner`: scheduling heuristics and feasibility checks.
-- `Sources/LLMRuntime`: Ollama and ONNX extraction/edit parsing runtimes.
+- `Sources/LLMRuntime`: ONNX extraction/edit parsing runtime (with optional Ollama adapter for dev experimentation).
 - `Sources/Ingestion`: Gmail/Outlook services, multi-account coordinator, adaptive scheduler, auto-planning apply.
 - `Sources/Integrations/Slack`: Socket Mode transport + command parsing.
 - `Sources/Integrations/Gmail`: Gmail list/get + cursor logic.
