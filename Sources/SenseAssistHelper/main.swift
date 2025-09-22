@@ -576,11 +576,13 @@ struct SenseAssistHelperMain {
         accountID: String,
         email: String
     ) throws -> OAuthCredential? {
-        if let primary = try store.load(provider: provider, accountID: accountID), !primary.accessToken.isEmpty {
+        if let primary = try store.load(provider: provider, accountID: accountID),
+           !primary.accessToken.isEmpty || (primary.refreshToken?.isEmpty == false) {
             return primary
         }
 
-        if let emailScoped = try store.load(provider: provider, accountID: email), !emailScoped.accessToken.isEmpty {
+        if let emailScoped = try store.load(provider: provider, accountID: email),
+           !emailScoped.accessToken.isEmpty || (emailScoped.refreshToken?.isEmpty == false) {
             return emailScoped
         }
 
