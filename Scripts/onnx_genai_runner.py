@@ -27,20 +27,20 @@ def _load_request() -> dict[str, Any]:
     return payload
 
 
-def _resolve_model_config_path(model_path: str) -> str:
+def _resolve_model_root(model_path: str) -> str:
     model_root = Path(model_path)
     if model_root.is_file():
+        # If a file path is provided (for example, genai_config.json), use its directory.
+        model_root = model_root.parent
+
+    genai_config = model_root / "genai_config.json"
+    if genai_config.exists():
         return str(model_root)
 
-    preferred = model_root / "genai_config.json"
-    if preferred.exists():
-        return str(preferred)
+    if (model_root / "config.json").exists():
+        _fatal(f"genai_config_not_found_in_model_root: {model_root}")
 
-    fallback = model_root / "config.json"
-    if fallback.exists():
-        return str(fallback)
-
-    _fatal(f"model_config_not_found: {model_root}")
+    _fatal(f"model_root_not_found: {model_root}")
     return ""  # Unreachable, but keeps static checkers happy.
 
 
@@ -65,6 +65,19 @@ def _apply_provider(config: Any, provider: str | None) -> None:
     config.append_provider(ep)
 
 
+def _format_prompt(tokenizer: Any, prompt: str) -> str:
+    apply_chat_template = getattr(tokenizer, "apply_chat_template", None)
+    if apply_chat_template is None:
+        return prompt
+
+    try:
+        messages = json.dumps([{"role": "user", "content": prompt}])
+        return apply_chat_template(messages, add_generation_prompt=True)
+    except Exception:
+        # Fall back to raw prompt if the model/chat-template is not compatible.
+        return prompt
+
+
 def main() -> None:
     request = _load_request()
 
@@ -87,12 +100,13 @@ def main() -> None:
         _fatal(f"onnxruntime_genai_import_failed: {exc}")
 
     try:
-        config = og.Config(_resolve_model_config_path(model_path))
+        config = og.Config(_resolve_model_root(model_path))
         _apply_provider(config, provider)
 
         model = og.Model(config)
         tokenizer = og.Tokenizer(model)
-        input_ids = tokenizer.encode(prompt)
+        formatted_prompt = _format_prompt(tokenizer, prompt)
+        input_ids = tokenizer.encode(formatted_prompt)
 
         # ORT GenAI uses max_length (prompt + generated). Keep generation bounded.
         prompt_token_count = int(getattr(input_ids, "size", len(input_ids)))
@@ -104,14 +118,15 @@ def main() -> None:
             temperature=max(0.0, temperature),
             top_p=min(max(top_p, 0.0), 1.0),
         )
-        params.set_model_input("input_ids", input_ids)
 
         generator = og.Generator(model, params)
+        generator.append_tokens(input_ids)
         while not generator.is_done():
             generator.generate_next_token()
 
         output_ids = generator.get_sequence(0)
-        text = tokenizer.decode(output_ids)
+        generated_ids = output_ids[prompt_token_count:]
+        text = tokenizer.decode(generated_ids)
     except Exception as exc:  # noqa: BLE001
         _fatal(f"onnxruntime_generation_failed: {exc}")
 
