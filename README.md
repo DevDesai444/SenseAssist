@@ -260,6 +260,35 @@ export SENSEASSIST_TOKEN_GMAIL_GMAIL_YOU_GMAIL_COM="<gmail-access-token>"
 export SENSEASSIST_TOKEN_OUTLOOK_OUTLOOK_YOU_BUFFALO_EDU="<outlook-access-token>"
 ```
 
+For long-running operation (no hourly manual token updates), set refresh token + app credentials.
+
+Refresh token env key format:
+
+```text
+SENSEASSIST_REFRESH_TOKEN_<PROVIDER>_<ACCOUNT_ID_OR_EMAIL_NORMALIZED>
+```
+
+Required app credentials for automatic refresh:
+
+```bash
+# Google
+export SENSEASSIST_GMAIL_CLIENT_ID="<google-oauth-client-id>"
+export SENSEASSIST_GMAIL_CLIENT_SECRET="<google-oauth-client-secret>"
+
+# Microsoft
+export SENSEASSIST_OUTLOOK_CLIENT_ID="<microsoft-app-client-id>"
+export SENSEASSIST_OUTLOOK_CLIENT_SECRET="<microsoft-app-client-secret>"
+# optional, defaults to "common"
+export SENSEASSIST_OUTLOOK_TENANT="common"
+```
+
+Example refresh-token exports:
+
+```bash
+export SENSEASSIST_REFRESH_TOKEN_GMAIL_GMAIL_YOU_GMAIL_COM="<gmail-refresh-token>"
+export SENSEASSIST_REFRESH_TOKEN_OUTLOOK_OUTLOOK_YOU_BUFFALO_EDU="<outlook-refresh-token>"
+```
+
 ### 3) Run one live sync pass
 
 ```bash
