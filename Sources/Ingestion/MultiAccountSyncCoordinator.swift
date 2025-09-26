@@ -8,6 +8,7 @@ import Foundation
 public struct MultiAccountSyncResult: Sendable {
     public var gmail: [GmailSyncSummary]
     public var outlook: [OutlookSyncSummary]
+    public var failures: [AccountSyncFailure]
 
     public var totalFetched: Int {
         gmail.reduce(0) { $0 + $1.fetchedMessages } + outlook.reduce(0) { $0 + $1.fetchedMessages }
@@ -21,9 +22,24 @@ public struct MultiAccountSyncResult: Sendable {
         gmail.reduce(0) { $0 + $1.createdOrUpdatedTasks } + outlook.reduce(0) { $0 + $1.createdOrUpdatedTasks }
     }
 
-    public init(gmail: [GmailSyncSummary], outlook: [OutlookSyncSummary]) {
+    public init(gmail: [GmailSyncSummary], outlook: [OutlookSyncSummary], failures: [AccountSyncFailure] = []) {
         self.gmail = gmail
         self.outlook = outlook
+        self.failures = failures
+    }
+}
+
+public struct AccountSyncFailure: Sendable {
+    public var provider: StorageProvider
+    public var accountID: String
+    public var accountEmail: String
+    public var reason: String
+
+    public init(provider: StorageProvider, accountID: String, accountEmail: String, reason: String) {
+        self.provider = provider
+        self.accountID = accountID
+        self.accountEmail = accountEmail
+        self.reason = reason
     }
 }
 
@@ -65,6 +81,7 @@ public final class MultiAccountSyncCoordinator {
 
         var gmailSummaries: [GmailSyncSummary] = []
         var outlookSummaries: [OutlookSyncSummary] = []
+        var failures: [AccountSyncFailure] = []
 
         for account in accounts {
             switch account.provider {
@@ -81,7 +98,18 @@ public final class MultiAccountSyncCoordinator {
                     confidenceThreshold: confidenceThreshold,
                     autoPlanningService: autoPlanningService
                 )
-                gmailSummaries.append(try await service.sync())
+                do {
+                    gmailSummaries.append(try await service.sync())
+                } catch {
+                    failures.append(
+                        AccountSyncFailure(
+                            provider: .gmail,
+                            accountID: account.accountID,
+                            accountEmail: account.email,
+                            reason: error.localizedDescription
+                        )
+                    )
+                }
             case .outlook:
                 guard let outlookClient = outlookClientFactory(account) else { continue }
                 let service = OutlookIngestionService(
@@ -95,10 +123,21 @@ public final class MultiAccountSyncCoordinator {
                     confidenceThreshold: confidenceThreshold,
                     autoPlanningService: autoPlanningService
                 )
-                outlookSummaries.append(try await service.sync())
+                do {
+                    outlookSummaries.append(try await service.sync())
+                } catch {
+                    failures.append(
+                        AccountSyncFailure(
+                            provider: .outlook,
+                            accountID: account.accountID,
+                            accountEmail: account.email,
+                            reason: error.localizedDescription
+                        )
+                    )
+                }
             }
         }
 
-        return MultiAccountSyncResult(gmail: gmailSummaries, outlook: outlookSummaries)
+        return MultiAccountSyncResult(gmail: gmailSummaries, outlook: outlookSummaries, failures: failures)
     }
 }

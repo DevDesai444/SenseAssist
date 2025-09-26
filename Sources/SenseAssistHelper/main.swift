@@ -521,6 +521,18 @@ struct SenseAssistHelperMain {
         )
 
         let result = try await coordinator.syncAllEnabledAccounts()
+        let failedAccountLines = result.failures.map { failure in
+            let compactReason = failure.reason
+                .replacingOccurrences(of: "\n", with: " ")
+                .trimmingCharacters(in: .whitespacesAndNewlines)
+            return "\(failure.provider.rawValue) \(failure.accountEmail): sync_failed: \(compactReason)"
+        }
+        skippedAccounts.append(contentsOf: failedAccountLines)
+
+        if result.gmail.isEmpty && result.outlook.isEmpty {
+            throw LiveSyncError.allAccountSyncsFailed(details: failedAccountLines)
+        }
+
         let totalUpdates = try updateRepository.count()
         let totalTasks = try taskRepository.count()
 
@@ -781,6 +793,7 @@ private struct OAuthRefreshPayload: Decodable {
 private enum LiveSyncError: Error, LocalizedError {
     case noEnabledAccounts
     case noCredentialsConfigured
+    case allAccountSyncsFailed(details: [String])
     case demoModeDisabled
     case onDeviceLLMNotConfigured
     case onDeviceLLMRunnerMissing(path: String)
@@ -791,6 +804,12 @@ private enum LiveSyncError: Error, LocalizedError {
             return "No enabled Gmail/Outlook accounts are configured."
         case .noCredentialsConfigured:
             return "No OAuth tokens found for enabled accounts. Configure tokens in Keychain or environment variables."
+        case let .allAccountSyncsFailed(details):
+            if details.isEmpty {
+                return "All enabled accounts failed during sync."
+            }
+            let joined = details.joined(separator: " | ")
+            return "All enabled accounts failed during sync: \(joined)"
         case .demoModeDisabled:
             return "Demo commands are disabled. Set SENSEASSIST_ENABLE_DEMO_COMMANDS=1 or pass --allow-demo."
         case .onDeviceLLMNotConfigured:
