@@ -282,6 +282,13 @@ export SENSEASSIST_OUTLOOK_CLIENT_SECRET="<microsoft-app-client-secret>"
 export SENSEASSIST_OUTLOOK_TENANT="common"
 ```
 
+By default, live sync reads OAuth credentials from environment variables only.
+To opt into keychain fallback reads, set:
+
+```bash
+export SENSEASSIST_USE_KEYCHAIN=1
+```
+
 Example refresh-token exports:
 
 ```bash

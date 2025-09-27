@@ -441,7 +441,17 @@ struct SenseAssistHelperMain {
         let taskRepository = TaskRepository(store: store)
         let planRevisionRepository = PlanRevisionRepository(store: store)
         let operationRepository = OperationRepository(store: store)
-        let credentialStore = ChainedCredentialStore(stores: [KeychainCredentialStore(), EnvironmentCredentialStore()])
+        let useKeychainCredentials = environment["SENSEASSIST_USE_KEYCHAIN"] == "1"
+        let credentialStore = ChainedCredentialStore(
+            stores: useKeychainCredentials
+                ? [
+                    EnvironmentCredentialStore(environment: environment),
+                    KeychainCredentialStore(allowUserInteraction: false)
+                ]
+                : [
+                    EnvironmentCredentialStore(environment: environment)
+                ]
+        )
         let llmRuntime = try configuredLLMRuntime()
 
         var gmailTokens: [String: String] = [:]

@@ -82,8 +82,12 @@ public final class ChainedCredentialStore: CredentialStore {
 
     public func load(provider: CredentialProvider, accountID: String) throws -> OAuthCredential? {
         for store in stores {
-            if let credential = try store.load(provider: provider, accountID: accountID) {
-                return credential
+            do {
+                if let credential = try store.load(provider: provider, accountID: accountID) {
+                    return credential
+                }
+            } catch {
+                continue
             }
         }
         return nil
