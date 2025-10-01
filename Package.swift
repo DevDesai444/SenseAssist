@@ -138,7 +138,8 @@ let package = Package(
                 "GmailIntegration",
                 "OutlookIntegration",
                 "LLMRuntime",
-                "Storage"
+                "Storage",
+                "EventKitAdapter"
             ]
         )
     ]
