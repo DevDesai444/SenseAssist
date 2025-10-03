@@ -1,6 +1,4 @@
-<p align="center">
-  <img src="Logos/3.png" alt="SenseAssist logo" width="180" />
-</p>
+![SenseAssist banner](Logos/3.png)
 
 # SenseAssist
 
