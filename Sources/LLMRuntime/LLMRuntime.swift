@@ -57,6 +57,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
     private let temperature: Double
     private let topP: Double
     private let provider: String?
+    private let plannerInputFilePath: String?
 
     public init(
         modelPath: String,
@@ -65,7 +66,8 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         maxNewTokens: Int = 512,
         temperature: Double = 0.2,
         topP: Double = 0.95,
-        provider: String? = nil
+        provider: String? = nil,
+        plannerInputFilePath: String? = nil
     ) {
         self.modelPath = modelPath
         self.runnerScriptPath = runnerScriptPath
@@ -74,6 +76,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         self.temperature = max(0.0, temperature)
         self.topP = min(max(topP, 0.0), 1.0)
         self.provider = provider
+        self.plannerInputFilePath = plannerInputFilePath
     }
 
     public func inferExtractTasks(from updates: [UpdateCard]) async throws -> [TaskItem] {
@@ -81,66 +84,93 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
             return []
         }
 
-        let simplifiedUpdates = updates.map { update in
-            [
-                "account_id": update.accountID,
-                "source": update.source.rawValue,
-                "message_id": update.providerIDs.messageID,
-                "subject": update.subject,
-                "body_text": String(update.bodyText.prefix(4000)),
-                "tags": update.tags
-            ] as [String: Any]
+        let basePrompt = buildTaskExtractionPrompt(updates: updates)
+        var prompt = basePrompt
+        var decoded: [ExtractedTaskPayload] = []
+        var lastRawOutput = ""
+        var lastError: Error?
+
+        for attempt in 1...3 {
+            do {
+                let raw = try generate(prompt: prompt)
+                lastRawOutput = raw
+                let json = try extractJSONArray(from: raw)
+                decoded = try JSONDecoder().decode([ExtractedTaskPayload].self, from: Data(json.utf8))
+                lastError = nil
+                break
+            } catch {
+                lastError = error
+                guard attempt < 3 else {
+                    throw error
+                }
+                prompt = buildExtractionRepairPrompt(
+                    basePrompt: basePrompt,
+                    previousOutput: lastRawOutput,
+                    errorDescription: error.localizedDescription
+                )
+            }
         }
 
-        let prompt = """
-        You are an extraction engine. Convert email updates into actionable tasks.
-        Return ONLY valid JSON array matching this schema exactly:
-        [
-          {
-            "source_message_id": "string",
-            "title": "string",
-            "category": "assignment|quiz|email_reply|application|leetcode|project|admin",
-            "due_at_local": "ISO-8601 datetime string or null",
-            "estimated_minutes": number,
-            "min_daily_minutes": number,
-            "priority": number,
-            "stress_weight": number,
-            "status": "todo|in_progress|done|ignored"
-          }
-        ]
-        Do not include markdown.
+        if let lastError {
+            throw lastError
+        }
 
-        Updates JSON:
-        \(jsonString(simplifiedUpdates))
-        """
-
-        let raw = try generate(prompt: prompt)
-        let json = try extractJSONArray(from: raw)
-        let decoded = try JSONDecoder().decode([ExtractedTaskPayload].self, from: Data(json.utf8))
         let updateByMessageID = Dictionary(uniqueKeysWithValues: updates.map { ($0.providerIDs.messageID, $0) })
 
-        return decoded.compactMap { payload in
+        var mapped = decoded.compactMap { payload -> ExtractedTaskCandidate? in
             guard let sourceUpdate = payload.sourceMessageID.flatMap({ updateByMessageID[$0] }) ?? updates.first else {
                 return nil
             }
 
+            let dueFromLLM = parseDueDate(payload.dueAtLocal)
+            let dueFromEvidence = parseDueDateFromEvidence(sourceUpdate.evidence, referenceDate: sourceUpdate.receivedAtUTC)
+            return ExtractedTaskCandidate(
+                payload: payload,
+                sourceUpdate: sourceUpdate,
+                dueAtLocal: dueFromLLM ?? dueFromEvidence
+            )
+        }
+
+        let unresolved = mapped.filter {
+            $0.dueAtLocal == nil && requiresDueDate(category: $0.payload.category)
+        }
+        if !unresolved.isEmpty {
+            let repaired = try repairDueDates(for: unresolved.map(\.sourceUpdate))
+            for index in mapped.indices {
+                guard mapped[index].dueAtLocal == nil else { continue }
+                let messageID = mapped[index].sourceUpdate.providerIDs.messageID
+                guard let repairedValue = repaired[messageID] else { continue }
+                mapped[index].dueAtLocal = parseDueDate(repairedValue)
+            }
+        }
+
+        return mapped.map { candidate in
+            let normalized = normalizeSchedulingFields(
+                category: candidate.payload.category,
+                estimatedMinutes: candidate.payload.estimatedMinutes,
+                minDailyMinutes: candidate.payload.minDailyMinutes,
+                priority: candidate.payload.priority,
+                dueAtLocal: candidate.dueAtLocal,
+                now: Date()
+            )
+
             return TaskItem(
-                title: payload.title,
-                category: payload.category,
-                dueAtLocal: parseDueDate(payload.dueAtLocal),
-                estimatedMinutes: max(15, payload.estimatedMinutes),
-                minDailyMinutes: max(15, payload.minDailyMinutes),
-                priority: max(1, payload.priority),
-                stressWeight: min(max(payload.stressWeight, 0.0), 1.0),
+                title: candidate.payload.title,
+                category: candidate.payload.category,
+                dueAtLocal: candidate.dueAtLocal,
+                estimatedMinutes: normalized.estimatedMinutes,
+                minDailyMinutes: normalized.minDailyMinutes,
+                priority: normalized.priority,
+                stressWeight: min(max(candidate.payload.stressWeight, 0.0), 1.0),
                 sources: [
                     TaskSource(
-                        source: sourceUpdate.source,
-                        accountID: sourceUpdate.accountID,
-                        messageID: sourceUpdate.providerIDs.messageID,
+                        source: candidate.sourceUpdate.source,
+                        accountID: candidate.sourceUpdate.accountID,
+                        messageID: candidate.sourceUpdate.providerIDs.messageID,
                         confidence: 0.85
                     )
                 ],
-                status: payload.status
+                status: candidate.payload.status
             )
         }
     }
@@ -200,27 +230,51 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
             return SchedulePlan(blocks: [], feasibilityState: .onTrack, unscheduledTaskIDs: [])
         }
 
-        let prompt = buildSchedulePrompt(
+        let basePrompt = buildSchedulePrompt(
             date: date,
             tasks: activeTasks,
             existingBlocks: existingBlocks,
             constraints: constraints,
             planRevision: planRevision,
-            timeZoneIdentifier: timeZoneIdentifier
+            timeZoneIdentifier: timeZoneIdentifier,
+            plannerInputFileContext: plannerInputContext(
+                preferredPath: plannerInputFilePath,
+                fallbackPath: ProcessInfo.processInfo.environment["SENSEASSIST_PLANNER_INPUT_PATH"]
+            )
         )
+        var prompt = basePrompt
+        var lastRawOutput = ""
+        var lastError: Error?
 
-        let raw = try generate(prompt: prompt)
-        let json = try extractJSONObject(from: raw)
-        let payload = try JSONDecoder().decode(SchedulePlanPayload.self, from: Data(json.utf8))
-        return try materializeSchedulePlan(
-            payload: payload,
-            date: date,
-            tasks: activeTasks,
-            existingBlocks: existingBlocks,
-            constraints: constraints,
-            planRevision: planRevision,
-            timeZoneIdentifier: timeZoneIdentifier
-        )
+        for attempt in 1...3 {
+            do {
+                let raw = try generate(prompt: prompt)
+                lastRawOutput = raw
+                let json = try extractJSONObject(from: raw)
+                let payload = try JSONDecoder().decode(SchedulePlanPayload.self, from: Data(json.utf8))
+                return try materializeSchedulePlan(
+                    payload: payload,
+                    date: date,
+                    tasks: activeTasks,
+                    existingBlocks: existingBlocks,
+                    constraints: constraints,
+                    planRevision: planRevision,
+                    timeZoneIdentifier: timeZoneIdentifier
+                )
+            } catch {
+                lastError = error
+                guard attempt < 3 else {
+                    throw error
+                }
+                prompt = buildScheduleRepairPrompt(
+                    basePrompt: basePrompt,
+                    previousOutput: lastRawOutput,
+                    errorDescription: error.localizedDescription
+                )
+            }
+        }
+
+        throw lastError ?? LLMRuntimeError.invalidJSON
     }
 
     private func generate(prompt: String) throws -> String {
@@ -305,26 +359,18 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
     }
 
     private func parseDueDate(_ value: String?) -> Date? {
-        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
+        parseLLMDueDate(value)
+    }
+
+    private func repairDueDates(for updates: [UpdateCard]) throws -> [String: String] {
+        guard !updates.isEmpty else {
+            return [:]
         }
 
-        let iso = ISO8601DateFormatter()
-        if let date = iso.date(from: value) {
-            return date
-        }
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        for format in ["yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
-            formatter.dateFormat = format
-            if let date = formatter.date(from: value) {
-                return date
-            }
-        }
-
-        return nil
+        let prompt = buildDueDateRepairPrompt(updates: updates)
+        let raw = try generate(prompt: prompt)
+        let json = try extractJSONObject(from: raw)
+        return try decodeDueDateRepairMap(json: json)
     }
 }
 
@@ -332,11 +378,18 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
     private let endpointURL: URL
     private let model: String
     private let session: URLSession
+    private let plannerInputFilePath: String?
 
-    public init(endpointURL: URL = URL(string: "http://127.0.0.1:11434")!, model: String, session: URLSession = .shared) {
+    public init(
+        endpointURL: URL = URL(string: "http://127.0.0.1:11434")!,
+        model: String,
+        session: URLSession = .shared,
+        plannerInputFilePath: String? = nil
+    ) {
         self.endpointURL = endpointURL
         self.model = model
         self.session = session
+        self.plannerInputFilePath = plannerInputFilePath
     }
 
     public func inferExtractTasks(from updates: [UpdateCard]) async throws -> [TaskItem] {
@@ -344,67 +397,93 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
             return []
         }
 
-        let simplifiedUpdates = updates.map { update in
-            [
-                "account_id": update.accountID,
-                "source": update.source.rawValue,
-                "message_id": update.providerIDs.messageID,
-                "subject": update.subject,
-                "body_text": String(update.bodyText.prefix(4000)),
-                "tags": update.tags
-            ] as [String: Any]
+        let basePrompt = buildTaskExtractionPrompt(updates: updates)
+        var prompt = basePrompt
+        var decoded: [ExtractedTaskPayload] = []
+        var lastRawOutput = ""
+        var lastError: Error?
+
+        for attempt in 1...3 {
+            do {
+                let raw = try await generate(prompt: prompt)
+                lastRawOutput = raw
+                let json = try extractJSONArray(from: raw)
+                decoded = try JSONDecoder().decode([ExtractedTaskPayload].self, from: Data(json.utf8))
+                lastError = nil
+                break
+            } catch {
+                lastError = error
+                guard attempt < 3 else {
+                    throw error
+                }
+                prompt = buildExtractionRepairPrompt(
+                    basePrompt: basePrompt,
+                    previousOutput: lastRawOutput,
+                    errorDescription: error.localizedDescription
+                )
+            }
         }
 
-        let prompt = """
-        You are an extraction engine. Convert email updates into actionable tasks.
-        Return ONLY valid JSON array matching this schema exactly:
-        [
-          {
-            "source_message_id": "string",
-            "title": "string",
-            "category": "assignment|quiz|email_reply|application|leetcode|project|admin",
-            "due_at_local": "ISO-8601 datetime string or null",
-            "estimated_minutes": number,
-            "min_daily_minutes": number,
-            "priority": number,
-            "stress_weight": number,
-            "status": "todo|in_progress|done|ignored"
-          }
-        ]
-        Do not include markdown.
+        if let lastError {
+            throw lastError
+        }
 
-        Updates JSON:
-        \(jsonString(simplifiedUpdates))
-        """
-
-        let raw = try await generate(prompt: prompt)
-        let json = try extractJSONArray(from: raw)
-
-        let decoded = try JSONDecoder().decode([ExtractedTaskPayload].self, from: Data(json.utf8))
         let updateByMessageID = Dictionary(uniqueKeysWithValues: updates.map { ($0.providerIDs.messageID, $0) })
 
-        return decoded.compactMap { payload in
+        var mapped = decoded.compactMap { payload -> ExtractedTaskCandidate? in
             guard let sourceUpdate = payload.sourceMessageID.flatMap({ updateByMessageID[$0] }) ?? updates.first else {
                 return nil
             }
 
+            let dueFromLLM = parseDueDate(payload.dueAtLocal)
+            let dueFromEvidence = parseDueDateFromEvidence(sourceUpdate.evidence, referenceDate: sourceUpdate.receivedAtUTC)
+            return ExtractedTaskCandidate(
+                payload: payload,
+                sourceUpdate: sourceUpdate,
+                dueAtLocal: dueFromLLM ?? dueFromEvidence
+            )
+        }
+
+        let unresolved = mapped.filter {
+            $0.dueAtLocal == nil && requiresDueDate(category: $0.payload.category)
+        }
+        if !unresolved.isEmpty {
+            let repaired = try await repairDueDates(for: unresolved.map(\.sourceUpdate))
+            for index in mapped.indices {
+                guard mapped[index].dueAtLocal == nil else { continue }
+                let messageID = mapped[index].sourceUpdate.providerIDs.messageID
+                guard let repairedValue = repaired[messageID] else { continue }
+                mapped[index].dueAtLocal = parseDueDate(repairedValue)
+            }
+        }
+
+        return mapped.map { candidate in
+            let normalized = normalizeSchedulingFields(
+                category: candidate.payload.category,
+                estimatedMinutes: candidate.payload.estimatedMinutes,
+                minDailyMinutes: candidate.payload.minDailyMinutes,
+                priority: candidate.payload.priority,
+                dueAtLocal: candidate.dueAtLocal,
+                now: Date()
+            )
+
             return TaskItem(
-                title: payload.title,
-                category: payload.category,
-                dueAtLocal: parseDueDate(payload.dueAtLocal),
-                estimatedMinutes: max(15, payload.estimatedMinutes),
-                minDailyMinutes: max(15, payload.minDailyMinutes),
-                priority: max(1, payload.priority),
-                stressWeight: min(max(payload.stressWeight, 0.0), 1.0),
+                title: candidate.payload.title,
+                category: candidate.payload.category,
+                dueAtLocal: candidate.dueAtLocal,
+                estimatedMinutes: normalized.estimatedMinutes,
+                minDailyMinutes: normalized.minDailyMinutes,
+                priority: normalized.priority,
+                stressWeight: min(max(candidate.payload.stressWeight, 0.0), 1.0),
                 sources: [
                     TaskSource(
-                        source: sourceUpdate.source,
-                        accountID: sourceUpdate.accountID,
-                        messageID: sourceUpdate.providerIDs.messageID,
+                        source: candidate.sourceUpdate.source,
+                        accountID: candidate.sourceUpdate.accountID,
+                        messageID: candidate.sourceUpdate.providerIDs.messageID,
                         confidence: 0.85
                     )
                 ],
-                status: payload.status
+                status: candidate.payload.status
             )
         }
     }
@@ -464,27 +543,51 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
             return SchedulePlan(blocks: [], feasibilityState: .onTrack, unscheduledTaskIDs: [])
         }
 
-        let prompt = buildSchedulePrompt(
+        let basePrompt = buildSchedulePrompt(
             date: date,
             tasks: activeTasks,
             existingBlocks: existingBlocks,
             constraints: constraints,
             planRevision: planRevision,
-            timeZoneIdentifier: timeZoneIdentifier
+            timeZoneIdentifier: timeZoneIdentifier,
+            plannerInputFileContext: plannerInputContext(
+                preferredPath: plannerInputFilePath,
+                fallbackPath: ProcessInfo.processInfo.environment["SENSEASSIST_PLANNER_INPUT_PATH"]
+            )
         )
+        var prompt = basePrompt
+        var lastRawOutput = ""
+        var lastError: Error?
 
-        let raw = try await generate(prompt: prompt)
-        let json = try extractJSONObject(from: raw)
-        let payload = try JSONDecoder().decode(SchedulePlanPayload.self, from: Data(json.utf8))
-        return try materializeSchedulePlan(
-            payload: payload,
-            date: date,
-            tasks: activeTasks,
-            existingBlocks: existingBlocks,
-            constraints: constraints,
-            planRevision: planRevision,
-            timeZoneIdentifier: timeZoneIdentifier
-        )
+        for attempt in 1...3 {
+            do {
+                let raw = try await generate(prompt: prompt)
+                lastRawOutput = raw
+                let json = try extractJSONObject(from: raw)
+                let payload = try JSONDecoder().decode(SchedulePlanPayload.self, from: Data(json.utf8))
+                return try materializeSchedulePlan(
+                    payload: payload,
+                    date: date,
+                    tasks: activeTasks,
+                    existingBlocks: existingBlocks,
+                    constraints: constraints,
+                    planRevision: planRevision,
+                    timeZoneIdentifier: timeZoneIdentifier
+                )
+            } catch {
+                lastError = error
+                guard attempt < 3 else {
+                    throw error
+                }
+                prompt = buildScheduleRepairPrompt(
+                    basePrompt: basePrompt,
+                    previousOutput: lastRawOutput,
+                    errorDescription: error.localizedDescription
+                )
+            }
+        }
+
+        throw lastError ?? LLMRuntimeError.invalidJSON
     }
 
     private func generate(prompt: String) async throws -> String {
@@ -534,26 +637,18 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
     }
 
     private func parseDueDate(_ value: String?) -> Date? {
-        guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
-            return nil
+        parseLLMDueDate(value)
+    }
+
+    private func repairDueDates(for updates: [UpdateCard]) async throws -> [String: String] {
+        guard !updates.isEmpty else {
+            return [:]
         }
 
-        let iso = ISO8601DateFormatter()
-        if let date = iso.date(from: value) {
-            return date
-        }
-
-        let formatter = DateFormatter()
-        formatter.locale = Locale(identifier: "en_US_POSIX")
-        formatter.timeZone = TimeZone.current
-        for format in ["yyyy-MM-dd HH:mm", "yyyy-MM-dd"] {
-            formatter.dateFormat = format
-            if let date = formatter.date(from: value) {
-                return date
-            }
-        }
-
-        return nil
+        let prompt = buildDueDateRepairPrompt(updates: updates)
+        let raw = try await generate(prompt: prompt)
+        let json = try extractJSONObject(from: raw)
+        return try decodeDueDateRepairMap(json: json)
     }
 }
 
@@ -726,6 +821,12 @@ private struct PlanningWindow {
     let end: Date
 }
 
+private struct PlannerInputFileContext {
+    let path: String
+    let snapshot: PlannerInputSnapshot
+    let rawJSON: String
+}
+
 private func planningWindow(for date: Date, constraints: PlannerConstraints, timeZoneIdentifier: String) -> PlanningWindow? {
     let timeZone = TimeZone(identifier: timeZoneIdentifier) ?? TimeZone.current
     var calendar = Calendar(identifier: .gregorian)
@@ -754,15 +855,37 @@ private func buildSchedulePrompt(
     existingBlocks: [CalendarBlock],
     constraints: PlannerConstraints,
     planRevision: Int,
-    timeZoneIdentifier: String
+    timeZoneIdentifier: String,
+    plannerInputFileContext: PlannerInputFileContext?
 ) -> String {
     let window = planningWindow(for: date, constraints: constraints, timeZoneIdentifier: timeZoneIdentifier)
+    let scheduleCalendar: Calendar = {
+        if let window {
+            return window.calendar
+        }
+        var fallback = Calendar(identifier: .gregorian)
+        fallback.timeZone = TimeZone(identifier: timeZoneIdentifier) ?? TimeZone.current
+        return fallback
+    }()
     let iso = ISO8601DateFormatter()
     iso.timeZone = TimeZone(identifier: timeZoneIdentifier) ?? TimeZone.current
     iso.formatOptions = [.withInternetDateTime]
 
     let taskPayloads: [[String: Any]] = tasks.map { task in
-        [
+        let daysUntilDue = task.dueAtLocal.map {
+            max(
+                0,
+                scheduleCalendar.dateComponents(
+                    [.day],
+                    from: scheduleCalendar.startOfDay(for: date),
+                    to: scheduleCalendar.startOfDay(for: $0)
+                ).day ?? 0
+            )
+        }
+        let isLargeAssignment = (task.category == .assignment || task.category == .project) && task.estimatedMinutes >= 180
+        let shouldDeferUntilDayBeforeDue = shouldDeferSmallNearDueTask(task: task, planningDate: date, calendar: scheduleCalendar)
+
+        return [
             "task_id": task.taskID.uuidString,
             "title": task.title,
             "category": task.category.rawValue,
@@ -770,7 +893,10 @@ private func buildSchedulePrompt(
             "estimated_minutes": task.estimatedMinutes,
             "min_daily_minutes": task.minDailyMinutes,
             "priority": task.priority,
-            "stress_weight": task.stressWeight
+            "stress_weight": task.stressWeight,
+            "days_until_due": daysUntilDue ?? NSNull(),
+            "is_large_assignment": isLargeAssignment,
+            "should_defer_until_day_before_due": shouldDeferUntilDayBeforeDue
         ]
     }
 
@@ -797,6 +923,28 @@ private func buildSchedulePrompt(
         "free_space_buffer_minutes": constraints.freeSpaceBufferMinutes
     ]
 
+    let plannerFileSection: String
+    let tasksSection: String
+    let busyBlocksSection: String
+    if let plannerInputFileContext {
+        plannerFileSection = """
+        Planner input file path:
+        \(plannerInputFileContext.path)
+
+        Planner input file summary:
+        tasks=\(plannerInputFileContext.snapshot.tasks.count) busy_blocks=\(plannerInputFileContext.snapshot.busyBlocks.count) plan_revision=\(plannerInputFileContext.snapshot.meta.planRevision)
+
+        Planner input file JSON (source of truth):
+        \(plannerInputFileContext.rawJSON)
+        """
+        tasksSection = "Tasks JSON omitted because planner_input JSON above is the source of truth."
+        busyBlocksSection = "Busy blocks JSON omitted because planner_input JSON above is the source of truth."
+    } else {
+        plannerFileSection = "Planner input file JSON is unavailable for this run."
+        tasksSection = scheduleJSONString(taskPayloads)
+        busyBlocksSection = scheduleJSONString(busyPayloads)
+    }
+
     return """
     You are a scheduling engine. Build a focused one-day schedule from tasks.
     Return ONLY valid JSON object matching this schema exactly:
@@ -818,6 +966,9 @@ private func buildSchedulePrompt(
     - Do not overlap with busy blocks.
     - Do not overlap generated blocks with each other.
     - Prioritize urgent/high-priority tasks first.
+    - If a task is short (estimated_minutes <= 90) and due in 2 days, prefer scheduling on the day before due date.
+    - If a task is large (estimated_minutes >= 180), allocate at least min_daily_minutes today when feasible.
+    - Example policy: if today is March 3, a short task due March 5 can be planned for March 4, while a large March 15 assignment still gets progress on March 3 and onward.
     - Split long work across multiple blocks if needed.
     - Use lock_level=\"flexible\" for generated work unless absolutely required.
     - Do not include markdown.
@@ -825,11 +976,13 @@ private func buildSchedulePrompt(
     Constraints JSON:
     \(scheduleJSONString(constraintsPayload))
 
+    \(plannerFileSection)
+
     Tasks JSON:
-    \(scheduleJSONString(taskPayloads))
+    \(tasksSection)
 
     Busy blocks JSON:
-    \(scheduleJSONString(busyPayloads))
+    \(busyBlocksSection)
     """
 }
 
@@ -849,6 +1002,11 @@ private func materializeSchedulePlan(
     let activeTasks = tasks.filter { $0.status == .todo || $0.status == .inProgress }
     let activeTaskByID = Dictionary(uniqueKeysWithValues: activeTasks.map { ($0.taskID, $0) })
     let activeTaskIDs = Set(activeTaskByID.keys)
+    let deferredTaskIDs = Set(
+        activeTasks
+            .filter { shouldDeferSmallNearDueTask(task: $0, planningDate: date, calendar: window.calendar) }
+            .map(\.taskID)
+    )
     let busyBlocks = existingBlocks.filter { $0.lockLevel == .locked || !$0.managedByAgent }
 
     let parsedCandidates = payload.blocks.compactMap { block -> (payload: ScheduleBlockPayload, start: Date, end: Date)? in
@@ -883,8 +1041,21 @@ private func materializeSchedulePlan(
             resolvedTaskID = nil
         }
 
+        if let resolvedTaskID, deferredTaskIDs.contains(resolvedTaskID) {
+            continue
+        }
+
         let title: String
         let trimmedTitle = candidate.payload.title.trimmingCharacters(in: .whitespacesAndNewlines)
+        if resolvedTaskID == nil, !trimmedTitle.isEmpty {
+            let normalizedTitle = trimmedTitle.lowercased()
+            let matchesDeferredTitle = activeTasks.contains { task in
+                deferredTaskIDs.contains(task.taskID) && normalizedTitle.contains(task.title.lowercased())
+            }
+            if matchesDeferredTitle {
+                continue
+            }
+        }
         if !trimmedTitle.isEmpty {
             title = trimmedTitle
         } else if let resolvedTaskID, let task = activeTaskByID[resolvedTaskID] {
@@ -1010,6 +1181,392 @@ private func scheduleJSONString(_ value: Any) -> String {
         return "{}"
     }
     return text
+}
+
+private func plannerInputContext(preferredPath: String?, fallbackPath: String?) -> PlannerInputFileContext? {
+    let candidatePaths = [preferredPath, fallbackPath]
+        .compactMap { $0?.trimmingCharacters(in: .whitespacesAndNewlines) }
+        .filter { !$0.isEmpty }
+
+    for rawPath in candidatePaths {
+        let path = (rawPath as NSString).expandingTildeInPath
+        let fileURL = URL(fileURLWithPath: path)
+
+        guard let data = try? Data(contentsOf: fileURL)
+        else {
+            continue
+        }
+
+        let decoder = JSONDecoder()
+        decoder.dateDecodingStrategy = .iso8601
+        guard let snapshot = try? decoder.decode(PlannerInputSnapshot.self, from: data) else {
+            continue
+        }
+
+        let encoder = JSONEncoder()
+        encoder.dateEncodingStrategy = .iso8601
+        guard let compactData = try? encoder.encode(snapshot),
+              let compactRawJSON = String(data: compactData, encoding: .utf8)
+        else {
+            continue
+        }
+
+        return PlannerInputFileContext(path: path, snapshot: snapshot, rawJSON: compactRawJSON)
+    }
+
+    return nil
+}
+
+private struct ExtractedTaskCandidate {
+    var payload: ExtractedTaskPayload
+    var sourceUpdate: UpdateCard
+    var dueAtLocal: Date?
+}
+
+private struct DueDateRepairEnvelope: Decodable {
+    let dueDates: [String: String?]
+
+    enum CodingKeys: String, CodingKey {
+        case dueDates = "due_dates"
+    }
+}
+
+private func extractionJSONString(_ value: Any) -> String {
+    guard JSONSerialization.isValidJSONObject(value),
+          let data = try? JSONSerialization.data(withJSONObject: value, options: [.prettyPrinted]),
+          let text = String(data: data, encoding: .utf8)
+    else {
+        return "[]"
+    }
+    return text
+}
+
+private func buildTaskExtractionPrompt(updates: [UpdateCard]) -> String {
+    let iso = ISO8601DateFormatter()
+    let simplifiedUpdates = updates.map { update in
+        [
+            "account_id": update.accountID,
+            "source": update.source.rawValue,
+            "message_id": update.providerIDs.messageID,
+            "received_at_utc": iso.string(from: update.receivedAtUTC),
+            "subject": update.subject,
+            "body_text": String(update.bodyText.prefix(4000)),
+            "tags": update.tags,
+            "evidence": update.evidence,
+            "parse_confidence": update.parseConfidence,
+            "requires_confirmation": update.requiresConfirmation
+        ] as [String: Any]
+    }
+
+    return """
+    You are an extraction engine. Convert academic email updates into actionable tasks.
+    Return ONLY valid JSON array matching this schema exactly:
+    [
+      {
+        "source_message_id": "string",
+        "title": "string",
+        "category": "assignment|quiz|email_reply|application|leetcode|project|admin",
+        "due_at_local": "ISO-8601 datetime string with timezone offset or null",
+        "estimated_minutes": number,
+        "min_daily_minutes": number,
+        "priority": number,
+        "stress_weight": number,
+        "status": "todo|in_progress|done|ignored"
+      }
+    ]
+    Requirements:
+    - Capture due dates for assignments/quizzes/applications whenever present.
+    - estimated_minutes must reflect total remaining effort.
+    - min_daily_minutes must reflect consistent daily progress for large work.
+    - For large assignments (estimated_minutes >= 180), choose meaningful min_daily_minutes, not tiny values.
+    - For short near-due work (estimated_minutes <= 90 and due soon), keep min_daily_minutes realistic.
+    - source_message_id must match an input message_id.
+    - Do not include markdown.
+
+    Updates JSON:
+    \(extractionJSONString(simplifiedUpdates))
+    """
+}
+
+private func buildDueDateRepairPrompt(updates: [UpdateCard]) -> String {
+    let payload: [[String: Any]] = updates.map { update in
+        [
+            "message_id": update.providerIDs.messageID,
+            "subject": update.subject,
+            "body_text": String(update.bodyText.prefix(2500)),
+            "evidence": update.evidence
+        ]
+    }
+
+    return """
+    You repair missing due dates for extracted academic tasks.
+    Return ONLY valid JSON object in one of these exact forms:
+    {"m1":"ISO-8601 datetime or null","m2":"ISO-8601 datetime or null"}
+    or
+    {"due_dates":{"m1":"ISO-8601 datetime or null","m2":"ISO-8601 datetime or null"}}
+    Rules:
+    - Keys must be message_id values from the input.
+    - Value must be ISO-8601 datetime with timezone offset when inferable, otherwise null.
+    - Do not include markdown.
+
+    Input JSON:
+    \(extractionJSONString(payload))
+    """
+}
+
+private func buildExtractionRepairPrompt(
+    basePrompt: String,
+    previousOutput: String,
+    errorDescription: String
+) -> String {
+    let outputSnippet = String(previousOutput.suffix(8000))
+    let safeError = errorDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+    return """
+    Your previous extraction output was invalid. Repair it now.
+    Return ONLY valid JSON array for the exact schema in the base instructions.
+    Do not include markdown.
+
+    Validation/Error context:
+    \(safeError)
+
+    Previous output:
+    \(outputSnippet)
+
+    Base instructions:
+    \(basePrompt)
+    """
+}
+
+private func buildScheduleRepairPrompt(
+    basePrompt: String,
+    previousOutput: String,
+    errorDescription: String
+) -> String {
+    let outputSnippet = String(previousOutput.suffix(8000))
+    let safeError = errorDescription.trimmingCharacters(in: .whitespacesAndNewlines)
+    return """
+    Your previous schedule output was invalid. Repair it now.
+    Return ONLY valid JSON object for the exact schema in the base instructions.
+    Keep all blocks non-overlapping and within day bounds.
+    Do not include markdown.
+
+    Validation/Error context:
+    \(safeError)
+
+    Previous output:
+    \(outputSnippet)
+
+    Base instructions:
+    \(basePrompt)
+    """
+}
+
+private func decodeDueDateRepairMap(json: String) throws -> [String: String] {
+    guard let data = json.data(using: .utf8) else {
+        throw LLMRuntimeError.invalidJSON
+    }
+
+    if let direct = try? JSONDecoder().decode([String: String?].self, from: data) {
+        return direct.compactMapValues { value in
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+                return nil
+            }
+            return value
+        }
+    }
+
+    if let wrapped = try? JSONDecoder().decode(DueDateRepairEnvelope.self, from: data) {
+        return wrapped.dueDates.compactMapValues { value in
+            guard let value = value?.trimmingCharacters(in: .whitespacesAndNewlines), !value.isEmpty else {
+                return nil
+            }
+            return value
+        }
+    }
+
+    throw LLMRuntimeError.invalidJSON
+}
+
+private func requiresDueDate(category: TaskCategory) -> Bool {
+    category == .assignment || category == .quiz || category == .application
+}
+
+private func parseLLMDueDate(_ value: String?) -> Date? {
+    guard let value, !value.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty else {
+        return nil
+    }
+
+    let iso = ISO8601DateFormatter()
+    iso.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+    if let date = iso.date(from: value) {
+        return date
+    }
+
+    iso.formatOptions = [.withInternetDateTime]
+    if let date = iso.date(from: value) {
+        return date
+    }
+
+    let formatter = DateFormatter()
+    formatter.locale = Locale(identifier: "en_US_POSIX")
+    formatter.timeZone = TimeZone.current
+    for format in [
+        "yyyy-MM-dd HH:mm",
+        "yyyy-MM-dd",
+        "MMM d yyyy h:mma",
+        "MMMM d yyyy h:mma",
+        "MMM d yyyy",
+        "MMMM d yyyy"
+    ] {
+        formatter.dateFormat = format
+        if let date = formatter.date(from: value) {
+            return date
+        }
+    }
+
+    return parseLooseDueDate(value, referenceDate: Date())
+}
+
+private func parseDueDateFromEvidence(_ evidence: [String], referenceDate: Date) -> Date? {
+    guard let dueEvidence = evidence.first(where: { $0.lowercased().hasPrefix("due_date:") }) else {
+        return nil
+    }
+
+    let dueText = String(dueEvidence.dropFirst("due_date:".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+    guard !dueText.isEmpty else {
+        return nil
+    }
+
+    return parseLooseDueDate(dueText, referenceDate: referenceDate)
+}
+
+private func parseLooseDueDate(_ text: String, referenceDate: Date) -> Date? {
+    let pattern = #"(?i)(jan(?:uary)?|feb(?:ruary)?|mar(?:ch)?|apr(?:il)?|may|jun(?:e)?|jul(?:y)?|aug(?:ust)?|sep(?:t(?:ember)?)?|oct(?:ober)?|nov(?:ember)?|dec(?:ember)?)\s+(\d{1,2})(?:,\s*(\d{4}))?(?:\s+(?:at\s+)?(\d{1,2})(?::(\d{2}))?\s*(am|pm)?)?"#
+    guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
+          let match = regex.firstMatch(in: text, options: [], range: NSRange(text.startIndex..<text.endIndex, in: text))
+    else {
+        return nil
+    }
+
+    func capture(_ group: Int) -> String? {
+        let range = match.range(at: group)
+        guard range.location != NSNotFound,
+              let swiftRange = Range(range, in: text)
+        else {
+            return nil
+        }
+        return String(text[swiftRange])
+    }
+
+    guard let monthText = capture(1), let dayText = capture(2), let day = Int(dayText) else {
+        return nil
+    }
+
+    let calendar = Calendar.current
+    let referenceYear = calendar.component(.year, from: referenceDate)
+    let year = capture(3).flatMap(Int.init) ?? referenceYear
+    let monthFormatter = DateFormatter()
+    monthFormatter.locale = Locale(identifier: "en_US_POSIX")
+    monthFormatter.dateFormat = "MMM"
+    let normalizedMonth = String(monthText.prefix(3)).capitalized
+    guard let monthDate = monthFormatter.date(from: normalizedMonth) else {
+        return nil
+    }
+    let month = calendar.component(.month, from: monthDate)
+
+    var hour = capture(4).flatMap(Int.init) ?? 23
+    let minute = capture(5).flatMap(Int.init) ?? (capture(4) == nil ? 59 : 0)
+    if let ampm = capture(6)?.lowercased() {
+        if ampm == "pm", hour < 12 { hour += 12 }
+        if ampm == "am", hour == 12 { hour = 0 }
+    }
+
+    var components = DateComponents()
+    components.year = year
+    components.month = month
+    components.day = day
+    components.hour = min(max(0, hour), 23)
+    components.minute = min(max(0, minute), 59)
+    components.second = 0
+    components.timeZone = TimeZone.current
+
+    guard var parsed = calendar.date(from: components) else {
+        return nil
+    }
+
+    if capture(3) == nil, parsed < referenceDate.addingTimeInterval(-48 * 3600),
+       let nextYear = calendar.date(byAdding: .year, value: 1, to: parsed) {
+        parsed = nextYear
+    }
+
+    return parsed
+}
+
+private func normalizeSchedulingFields(
+    category: TaskCategory,
+    estimatedMinutes: Int,
+    minDailyMinutes: Int,
+    priority: Int,
+    dueAtLocal: Date?,
+    now: Date
+) -> (estimatedMinutes: Int, minDailyMinutes: Int, priority: Int) {
+    var estimated = max(15, estimatedMinutes)
+    var dailyMinimum = max(15, minDailyMinutes)
+    var normalizedPriority = max(1, priority)
+
+    let isLargeWork = (category == .assignment || category == .project) && estimated >= 180
+    if isLargeWork {
+        normalizedPriority = max(normalizedPriority, 3)
+        dailyMinimum = max(dailyMinimum, 30)
+    }
+
+    if let dueAtLocal {
+        let calendar = Calendar.current
+        let daysUntilDue = max(
+            0,
+            calendar.dateComponents(
+                [.day],
+                from: calendar.startOfDay(for: now),
+                to: calendar.startOfDay(for: dueAtLocal)
+            ).day ?? 0
+        )
+
+        if daysUntilDue <= 1 {
+            normalizedPriority = max(normalizedPriority, 5)
+            dailyMinimum = max(dailyMinimum, min(estimated, max(45, estimated / 2)))
+        } else if daysUntilDue <= 2 {
+            normalizedPriority = max(normalizedPriority, 4)
+        }
+
+        if isLargeWork {
+            let spreadDays = max(1, daysUntilDue + 1)
+            let recommendedDaily = Int(ceil(Double(estimated) / Double(spreadDays)))
+            dailyMinimum = max(dailyMinimum, min(180, max(30, recommendedDaily)))
+        }
+
+        // Keep short near-due tasks realistic so they can land day-before-due.
+        if (category == .assignment || category == .quiz), estimated <= 90, daysUntilDue == 2 {
+            dailyMinimum = min(dailyMinimum, 45)
+        }
+    }
+
+    estimated = max(15, estimated)
+    dailyMinimum = max(15, min(dailyMinimum, estimated))
+    return (estimated, dailyMinimum, normalizedPriority)
+}
+
+private func shouldDeferSmallNearDueTask(task: TaskItem, planningDate: Date, calendar: Calendar) -> Bool {
+    guard task.category == .assignment || task.category == .quiz else {
+        return false
+    }
+    guard task.estimatedMinutes <= 90, let dueAtLocal = task.dueAtLocal else {
+        return false
+    }
+
+    let planningStart = calendar.startOfDay(for: planningDate)
+    let dueStart = calendar.startOfDay(for: dueAtLocal)
+    let daysUntilDue = max(0, calendar.dateComponents([.day], from: planningStart, to: dueStart).day ?? 0)
+    return daysUntilDue == 2
 }
 
 private struct OllamaGenerateRequest: Encodable {

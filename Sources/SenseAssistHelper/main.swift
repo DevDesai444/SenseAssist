@@ -428,6 +428,9 @@ struct SenseAssistHelperMain {
         try store.initialize()
         defer { store.close() }
         let environment = ProcessInfo.processInfo.environment
+        let schedulerMode = schedulerExecutionMode(from: environment["SENSEASSIST_LLM_SCHEDULER_MODE"])
+        let routineTaskDefinitions = defaultDailyRoutineTasks(from: environment)
+        let plannerInputFilePath = resolvePlannerInputFilePath(config: config, environment: environment)
 
         let accountRepository = AccountRepository(store: store)
         let enabledAccounts = try accountRepository.list(enabledOnly: true)
@@ -452,7 +455,7 @@ struct SenseAssistHelperMain {
                     EnvironmentCredentialStore(environment: environment)
                 ]
         )
-        let llmRuntime = try configuredLLMRuntime()
+        let llmRuntime = try configuredLLMRuntime(plannerInputFilePath: plannerInputFilePath)
 
         var gmailTokens: [String: String] = [:]
         var outlookTokens: [String: String] = [:]
@@ -502,6 +505,9 @@ struct SenseAssistHelperMain {
                 operationRepository: operationRepository,
                 calendarStore: eventKitService,
                 schedulerLLMRuntime: llmRuntime,
+                schedulerMode: schedulerMode,
+                dailyRoutineTasks: routineTaskDefinitions,
+                plannerInputFilePath: plannerInputFilePath,
                 managedCalendarName: "SenseAssist",
                 constraints: config.constraints
             )
@@ -560,6 +566,9 @@ struct SenseAssistHelperMain {
         )
         lines.append("skipped_accounts=\(skippedAccounts.count)")
         lines.append(contentsOf: skippedAccounts.map { "skipped: \($0)" })
+        lines.append("scheduler_mode=\(schedulerMode.rawValue)")
+        lines.append("daily_routine_tasks=\(routineTaskDefinitions.count)")
+        lines.append("planner_input_file=\(plannerInputFilePath)")
         lines.append(
             "totals: fetched=\(result.totalFetched) updates=\(totalUpdates) tasks=\(totalTasks) enabled_accounts=\(enabledAccounts.count)"
         )
@@ -567,7 +576,39 @@ struct SenseAssistHelperMain {
         return LiveSyncExecutionResult(report: lines.joined(separator: "\n"), totalFetched: result.totalFetched)
     }
 
-    private static func configuredLLMRuntime() throws -> LLMRuntimeClient {
+    private static func schedulerExecutionMode(from rawValue: String?) -> SchedulerExecutionMode {
+        guard let normalized = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !normalized.isEmpty
+        else {
+            return .llmOnly
+        }
+
+        return SchedulerExecutionMode(rawValue: normalized) ?? .llmOnly
+    }
+
+    private static func defaultDailyRoutineTasks(from environment: [String: String]) -> [DailyRoutineTaskDefinition] {
+        let raw = environment["SENSEASSIST_ENABLE_DAILY_ROUTINE_TASKS"]?
+            .trimmingCharacters(in: .whitespacesAndNewlines)
+            .lowercased()
+
+        if raw == "0" || raw == "false" || raw == "no" {
+            return []
+        }
+
+        return DailyRoutineTaskDefinition.studentDefaults
+    }
+
+    private static func resolvePlannerInputFilePath(config: SenseAssistConfiguration, environment: [String: String]) -> String {
+        if let explicit = environment["SENSEASSIST_PLANNER_INPUT_PATH"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicit.isEmpty {
+            return (explicit as NSString).expandingTildeInPath
+        }
+
+        let dbURL = URL(fileURLWithPath: config.databasePath)
+        return dbURL.deletingLastPathComponent().appendingPathComponent("planner_input.json").path
+    }
+
+    private static func configuredLLMRuntime(plannerInputFilePath: String?) throws -> LLMRuntimeClient {
         let environment = ProcessInfo.processInfo.environment
 
         guard let onnxModelPath = environment["SENSEASSIST_ONNX_MODEL_PATH"], !onnxModelPath.isEmpty else {
@@ -592,7 +633,8 @@ struct SenseAssistHelperMain {
             maxNewTokens: maxNewTokens,
             temperature: temperature,
             topP: topP,
-            provider: provider
+            provider: provider,
+            plannerInputFilePath: plannerInputFilePath
         )
     }
 
