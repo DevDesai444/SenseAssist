@@ -47,19 +47,45 @@ SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans d
 ## Architecture
 
 ```mermaid
-flowchart LR
-    A["Gmail API"] --> B["GmailIngestionService"]
-    C["Outlook Graph API"] --> D["OutlookIngestionService"]
-    B --> E["ParserPipeline + RulesEngine"]
+flowchart TB
+    subgraph External
+        A["Gmail API"]
+        C["Outlook Graph API"]
+        M["Slack Socket Mode"]
+    end
+
+    subgraph Ingestion
+        B["GmailIngestionService"]
+        D["OutlookIngestionService"]
+        E["ParserPipeline + RulesEngine"]
+        F["LLMRuntime<br/>(Task Extraction)"]
+    end
+
+    subgraph Planning
+        G["Storage<br/>(SQLite tasks/updates)"]
+        H["AutoPlanningService"]
+        I["planner_input.json"]
+        J["LLMRuntime<br/>(Schedule + Repair)"]
+        K["SchedulePlan<br/>Validation"]
+        N["PlanCommandService"]
+    end
+
+    subgraph Execution
+        L["EventKitAdapter<br/>(Managed Blocks)"]
+    end
+
+    A --> B
+    C --> D
+    B --> E
     D --> E
-    E --> F["LLMRuntime: task extraction"]
-    F --> G["Storage (SQLite tasks/updates)"]
-    G --> H["AutoPlanningService"]
-    H --> I["planner_input.json snapshot"]
-    I --> J["LLMRuntime: schedule inference + repair retries"]
-    J --> K["SchedulePlan validation/materialization"]
-    K --> L["EventKitAdapter (managed blocks)"]
-    M["Slack Socket Mode"] --> N["PlanCommandService"]
+    E --> F
+    F --> G
+    G --> H
+    H --> I
+    I --> J
+    J --> K
+    K --> L
+    M --> N
     N --> L
     N --> G
 ```
