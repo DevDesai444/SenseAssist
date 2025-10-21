@@ -430,6 +430,7 @@ struct SenseAssistHelperMain {
         let environment = ProcessInfo.processInfo.environment
         let schedulerMode = schedulerExecutionMode(from: environment["SENSEASSIST_LLM_SCHEDULER_MODE"])
         let routineTaskDefinitions = defaultDailyRoutineTasks(from: environment)
+        let schedulerMinimumTaskConfidence = schedulerMinimumTaskConfidence(from: environment, fallback: config.confidenceThreshold)
         let plannerInputFilePath = resolvePlannerInputFilePath(config: config, environment: environment)
 
         let accountRepository = AccountRepository(store: store)
@@ -507,6 +508,7 @@ struct SenseAssistHelperMain {
                 schedulerLLMRuntime: llmRuntime,
                 schedulerMode: schedulerMode,
                 dailyRoutineTasks: routineTaskDefinitions,
+                minimumTaskSourceConfidenceForScheduling: schedulerMinimumTaskConfidence,
                 plannerInputFilePath: plannerInputFilePath,
                 managedCalendarName: "SenseAssist",
                 constraints: config.constraints
@@ -567,6 +569,7 @@ struct SenseAssistHelperMain {
         lines.append("skipped_accounts=\(skippedAccounts.count)")
         lines.append(contentsOf: skippedAccounts.map { "skipped: \($0)" })
         lines.append("scheduler_mode=\(schedulerMode.rawValue)")
+        lines.append("scheduler_min_task_confidence=\(schedulerMinimumTaskConfidence)")
         lines.append("daily_routine_tasks=\(routineTaskDefinitions.count)")
         lines.append("planner_input_file=\(plannerInputFilePath)")
         lines.append(
@@ -596,6 +599,16 @@ struct SenseAssistHelperMain {
         }
 
         return DailyRoutineTaskDefinition.studentDefaults
+    }
+
+    private static func schedulerMinimumTaskConfidence(from environment: [String: String], fallback: Double) -> Double {
+        guard let raw = environment["SENSEASSIST_SCHEDULER_MIN_TASK_CONFIDENCE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+              let parsed = Double(raw)
+        else {
+            return min(max(fallback, 0.0), 1.0)
+        }
+
+        return min(max(parsed, 0.0), 1.0)
     }
 
     private static func resolvePlannerInputFilePath(config: SenseAssistConfiguration, environment: [String: String]) -> String {

@@ -167,7 +167,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
                         source: candidate.sourceUpdate.source,
                         accountID: candidate.sourceUpdate.accountID,
                         messageID: candidate.sourceUpdate.providerIDs.messageID,
-                        confidence: 0.85
+                        confidence: min(max(candidate.sourceUpdate.parseConfidence, 0.0), 1.0)
                     )
                 ],
                 status: candidate.payload.status
@@ -480,7 +480,7 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
                         source: candidate.sourceUpdate.source,
                         accountID: candidate.sourceUpdate.accountID,
                         messageID: candidate.sourceUpdate.providerIDs.messageID,
-                        confidence: 0.85
+                        confidence: min(max(candidate.sourceUpdate.parseConfidence, 0.0), 1.0)
                     )
                 ],
                 status: candidate.payload.status

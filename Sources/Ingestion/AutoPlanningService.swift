@@ -122,6 +122,7 @@ public final class AutoPlanningService {
     private let schedulerLLMRuntime: LLMRuntimeClient?
     private let schedulerMode: SchedulerExecutionMode
     private let dailyRoutineTasks: [DailyRoutineTaskDefinition]
+    private let minimumTaskSourceConfidenceForScheduling: Double
     private let plannerInputFilePath: String?
     private let managedCalendarName: String
     private let constraints: PlannerConstraints
@@ -135,6 +136,7 @@ public final class AutoPlanningService {
         schedulerLLMRuntime: LLMRuntimeClient? = nil,
         schedulerMode: SchedulerExecutionMode = .llmOnly,
         dailyRoutineTasks: [DailyRoutineTaskDefinition] = DailyRoutineTaskDefinition.studentDefaults,
+        minimumTaskSourceConfidenceForScheduling: Double = 0.80,
         plannerInputFilePath: String? = nil,
         managedCalendarName: String = "SenseAssist",
         constraints: PlannerConstraints,
@@ -147,6 +149,7 @@ public final class AutoPlanningService {
         self.schedulerLLMRuntime = schedulerLLMRuntime
         self.schedulerMode = schedulerMode
         self.dailyRoutineTasks = dailyRoutineTasks
+        self.minimumTaskSourceConfidenceForScheduling = min(max(minimumTaskSourceConfidenceForScheduling, 0.0), 1.0)
         self.plannerInputFilePath = plannerInputFilePath
         self.managedCalendarName = managedCalendarName
         self.constraints = constraints
@@ -154,7 +157,13 @@ public final class AutoPlanningService {
     }
 
     public func regenerate(now: Date = Date(), trigger: String) async throws -> AutoPlanningApplySummary {
-        let persistedTasks = try taskRepository.listActive()
+        let persistedTasks = try taskRepository.listActive().filter { task in
+            let bestSourceConfidence = task.sources.map(\.confidence).max()
+            if let bestSourceConfidence {
+                return bestSourceConfidence >= minimumTaskSourceConfidenceForScheduling
+            }
+            return true
+        }
         let routineTasksForDay = buildDailyRoutineTasks(for: now)
         let activeTasks = mergeTasks(persistedTasks, with: routineTasksForDay)
         try await calendarStore.ensureManagedCalendar(named: managedCalendarName)
