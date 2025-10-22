@@ -132,6 +132,55 @@ make llm-bench
 
 Benchmark reports are written to `Docs/benchmarks/` (JSON + Markdown).
 
+## On-device benchmark results (March 3, 2026)
+
+### Benchmark profile
+
+| Field | Value |
+| --- | --- |
+| Model | `Phi-3.5-mini-instruct-onnx` (`cpu-int4-awq-block-128-acc-level-4`) |
+| Suite | `standard` (`3` measured + `1` warmup per case) |
+| Total measured runs | `9` |
+| Timestamp (UTC) | `2026-03-03T06:14:56Z` |
+
+### Overall metrics
+
+| Metric | Mean | P50 | P90 | P95 | Min | Max |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: |
+| Time to First Token (`ttft_ms`) | 0.56 ms | 0.12 | 1.00 | 2.51 | 0.07 | 4.02 |
+| Total Response Latency (`total_latency_ms`) | 25,892.49 ms | 26,083.66 | 33,722.91 | 33,904.65 | 17,693.88 | 34,086.40 |
+| Generation Latency (`generation_latency_ms`) | 14,820.02 ms | 15,511.31 | 20,990.17 | 21,119.31 | 8,084.75 | 21,248.45 |
+| Setup Latency (`setup_latency_ms`) | 11,072.13 ms | 10,572.07 | 12,932.82 | 13,123.13 | 9,608.87 | 13,313.43 |
+| Tokens Per Second (`tokens_per_second`) | 10.36 | 9.77 | 12.66 | 13.22 | 8.52 | 13.78 |
+| End-to-end Tokens Per Second (`e2e_tokens_per_second`) | 5.81 | 5.71 | 7.45 | 7.63 | 4.17 | 7.81 |
+| Generated Tokens | 154.33 | 192.00 | 192.00 | 192.00 | 79.00 | 192.00 |
+| Subprocess Wall Latency (`subprocess_wall_latency_ms`) | 26,058.66 ms | 26,244.63 | 33,904.59 | 34,086.31 | 17,901.87 | 34,268.03 |
+| Subprocess Overhead (`subprocess_overhead_ms`) | 166.17 ms | 160.97 | 186.96 | 197.48 | 132.52 | 207.99 |
+
+### Per-scenario metrics
+
+| Case | Success | Mean TTFT (ms) | P95 TTFT (ms) | Mean Total Latency (ms) | P95 Total Latency (ms) | Mean Tokens/s | Mean E2E Tokens/s | Mean Output Tokens |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| `json_contract_short` | 3/3 | 0.08 | 0.10 | 18,495.14 | 18,922.84 | 9.01 | 4.28 | 79.00 |
+| `task_extraction_medium` | 3/3 | 1.42 | 3.63 | 26,787.67 | 29,339.34 | 12.05 | 7.21 | 192.00 |
+| `schedule_planning_long` | 3/3 | 0.18 | 0.24 | 32,394.66 | 34,040.96 | 10.03 | 5.95 | 192.00 |
+
+### Metric definitions
+
+| Metric | Definition |
+| --- | --- |
+| `ttft_ms` | Elapsed time from generation start to first generated token. |
+| `tokens_per_second` | `generated_tokens / generation_latency`. |
+| `total_latency_ms` | Setup + generation + decode latency inside the runner. |
+| `e2e_tokens_per_second` | `generated_tokens / total_latency`. |
+
+### Benchmark commands
+
+| Purpose | Command |
+| --- | --- |
+| Re-run benchmark | `make llm-bench` |
+| Re-run with pinned output files | `bash Scripts/benchmark_phi35_instruct_onnx.sh --suite standard --runs 3 --warmup-runs 1 --max-new-tokens 192 --output-json Docs/ON_DEVICE_MODEL_BENCHMARK.json --output-markdown Docs/ON_DEVICE_MODEL_BENCHMARK.md` |
+
 ### 3) Configure OAuth credentials (env-first)
 
 Create `.env.oauth.local`:
