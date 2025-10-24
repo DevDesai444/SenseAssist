@@ -12,7 +12,7 @@ SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans d
 - Platform: macOS 13+
 - Language: Swift 6
 - Runtime mode: local-first (no cloud dependency required for planning)
-- Test status: 39/39 tests passing (`swift test`)
+- Test status: 40/40 tests passing (`swift test`)
 - Full project + benchmark documentation: `PROJECT_DOCUMENTATION_2026-03-03.md`
 
 ## Why SenseAssist
@@ -30,11 +30,16 @@ SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans d
   - Per-account cursor persistence and deduplicated update ingestion.
 - Task intelligence:
   - Rule-based parsing for trusted sources, digest splitting, tagging, and confidence scoring.
-  - LLM extraction from approved updates into normalized `TaskItem` records.
+  - Intent triage classifies approved updates as `actionable`, `maybe_actionable`, or `ignore`.
+  - `maybe_actionable` and uncertain updates are stored with `review_queue` tags and `requires_confirmation=1`.
+  - LLM extraction runs only on triaged actionable updates and writes normalized `TaskItem` records.
+  - Task source confidence now propagates from parser confidence (no fixed hardcoded confidence).
   - Due-date repair pass when extraction misses required due dates.
 - Scheduling:
   - LLM-only scheduler for auto-planning (`llm_only` mode).
+  - Auto-planning runs once per full multi-account sync cycle (`sync_all_accounts` trigger).
   - `planner_input.json` snapshot generated before each planning run and consumed by runtime prompts.
+  - Scheduler input can filter persisted tasks by source confidence threshold.
   - Student routine task injection (LeetCode, internships, meals, hygiene, mental reset) with opt-out env flag.
   - Policy-aware scheduling prompts:
     - defer short due-soon tasks (example: due in 2 days) toward day-before-due when feasible
@@ -59,11 +64,14 @@ flowchart TB
         B["GmailIngestionService"]
         D["OutlookIngestionService"]
         E["ParserPipeline + RulesEngine"]
+        T["TaskIntentTriageEngine"]
         F["LLMRuntime<br/>(Task Extraction)"]
+        RQ["Review Queue<br/>(requires_confirmation)"]
     end
 
     subgraph Planning
         G["Storage<br/>(SQLite tasks/updates)"]
+        SC["MultiAccountSyncCoordinator<br/>(single planning trigger)"]
         H["AutoPlanningService"]
         I["planner_input.json"]
         J["LLMRuntime<br/>(Schedule + Repair)"]
@@ -79,9 +87,12 @@ flowchart TB
     C --> D
     B --> E
     D --> E
-    E --> F
+    E --> T
+    T --> F
+    T --> RQ
     F --> G
-    G --> H
+    G --> SC
+    SC --> H
     H --> I
     I --> J
     J --> K
@@ -233,6 +244,9 @@ make db-summary
   - `SENSEASSIST_PLANNER_INPUT_PATH` (optional absolute/tilde path).
   - Default: `<db_directory>/planner_input.json`.
   - Snapshot is written before every auto-planning run and then consumed by scheduling prompts.
+- Scheduler confidence gate:
+  - `SENSEASSIST_SCHEDULER_MIN_TASK_CONFIDENCE` (default: `confidenceThreshold` from config, typically `0.80`).
+  - Persisted tasks with lower source confidence are excluded from scheduler input.
 - Daily routine tasks:
   - `SENSEASSIST_ENABLE_DAILY_ROUTINE_TASKS` (default enabled).
   - Set `0`, `false`, or `no` to disable injected routine tasks.
@@ -338,7 +352,8 @@ SenseAssist is built for controlled automation with explicit validation:
   - Auto-planning requires LLM scheduler availability (`llm_only`).
   - No deterministic scheduler fallback in the live auto-planning path.
 - Output hardening:
-  - LLM extraction and schedule generation use multi-attempt repair prompts on invalid output.
+  - JSON responses are schema-constrained in prompts and validated through Swift decoding/materialization checks.
+  - LLM extraction and schedule generation each use one repair re-prompt on invalid output (2 total attempts) before graceful failure.
   - Schedule output is validated against time-window, overlap, and constraint rules before calendar writes.
 - Auditable mutations:
   - Managed calendar-only writes.
