@@ -6,7 +6,7 @@ Local-first, on-device AI assistant that converts inbox updates into auditable c
 
 SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans deep-work blocks with an on-device LLM, and applies managed changes to Apple Calendar with revisioned history.
 
-## Project status (March 3, 2026)
+## Project status (March 4, 2026)
 
 - Stage: Beta OSS
 - Platform: macOS 13+
@@ -35,6 +35,10 @@ SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans d
   - LLM extraction runs only on triaged actionable updates and writes normalized `TaskItem` records.
   - Task source confidence now propagates from parser confidence (no fixed hardcoded confidence).
   - Due-date repair pass when extraction misses required due dates.
+- LLM runtime performance:
+  - ONNX runner uses warm daemon mode by default, so model/tokenizer load is reused across requests.
+  - Operation-specific token budgets cap generation for extraction, due-date repair, Slack edit parsing, and schedule planning.
+  - Fallback path keeps one-shot runner behavior if daemon transport fails.
 - Scheduling:
   - LLM-only scheduler for auto-planning (`llm_only` mode).
   - Auto-planning runs once per full multi-account sync cycle (`sync_all_accounts` trigger).
@@ -154,6 +158,9 @@ Benchmark reports are written to `Docs/benchmarks/` (JSON + Markdown).
 | Total measured runs | `9` |
 | Timestamp (UTC) | `2026-03-03T06:14:56Z` |
 
+Note: these numbers are a pre-daemon baseline captured before the warm ONNX daemon optimization added on March 4, 2026.
+Re-run `make llm-bench` to capture post-update metrics for your machine.
+
 ### Overall metrics
 
 | Metric | Mean | P50 | P90 | P95 | Min | Max |
@@ -182,7 +189,7 @@ Benchmark reports are written to `Docs/benchmarks/` (JSON + Markdown).
 | --- | --- |
 | `ttft_ms` | Elapsed time from generation start to first generated token. |
 | `tokens_per_second` | `generated_tokens / generation_latency`. |
-| `total_latency_ms` | Setup + generation + decode latency inside the runner. |
+| `total_latency_ms` | Setup + generation + decode latency inside the runner. In this report, setup includes one-shot model load. |
 | `e2e_tokens_per_second` | `generated_tokens / total_latency`. |
 
 ### Benchmark commands
@@ -254,7 +261,13 @@ make db-summary
   - `SENSEASSIST_ONNX_MODEL_PATH` (required for live sync).
   - `SENSEASSIST_ONNX_RUNNER` (default: `Scripts/onnx_genai_runner.py`).
   - `SENSEASSIST_ONNX_PYTHON` (default: `/usr/bin/python3`).
+  - Runner uses warm daemon mode by default to avoid reloading model weights on every request.
   - `SENSEASSIST_ONNX_MAX_NEW_TOKENS`, `SENSEASSIST_ONNX_TEMPERATURE`, `SENSEASSIST_ONNX_TOP_P`.
+  - Optional per-intent token caps:
+    - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_EXTRACT`
+    - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_DUE_REPAIR`
+    - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_EDIT`
+    - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_SCHEDULE`
   - `SENSEASSIST_ONNX_PROVIDER` (optional provider hint for runner).
 - OAuth:
   - `SENSEASSIST_GMAIL_CLIENT_ID`, `SENSEASSIST_GMAIL_CLIENT_SECRET`.
