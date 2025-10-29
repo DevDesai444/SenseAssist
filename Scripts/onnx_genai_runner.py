@@ -12,7 +12,7 @@ import argparse
 import json
 import sys
 import time
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -32,6 +32,9 @@ class RuntimeState:
     provider_key: str | None = None
     model: Any = None
     tokenizer: Any = None
+    prompt_token_cache: dict[str, Any] = field(default_factory=dict)
+    prompt_cache_order: list[str] = field(default_factory=list)
+    prompt_cache_limit: int = 32
 
 
 def _load_request() -> dict[str, Any]:
@@ -52,6 +55,8 @@ def _parse_request(payload: dict[str, Any]) -> dict[str, Any]:
     top_p = float(payload.get("top_p", 0.95))
     provider = payload.get("provider")
     provider = str(provider) if provider is not None else None
+    cache_key = payload.get("cache_key")
+    cache_key = str(cache_key).strip() if cache_key is not None else None
 
     if not model_path:
         raise RunnerError("missing_model_path")
@@ -65,6 +70,7 @@ def _parse_request(payload: dict[str, Any]) -> dict[str, Any]:
         "temperature": temperature,
         "top_p": top_p,
         "provider": provider,
+        "cache_key": cache_key if cache_key else None,
     }
 
 
@@ -132,6 +138,8 @@ def _ensure_runtime(og: Any, state: RuntimeState, model_path: str, provider: str
     state.provider_key = normalized_provider
     state.model = model
     state.tokenizer = tokenizer
+    state.prompt_token_cache.clear()
+    state.prompt_cache_order.clear()
 
     return True, max(finished - started, 0.0) * 1000.0
 
@@ -147,6 +155,51 @@ def _format_prompt(tokenizer: Any, prompt: str) -> str:
     except Exception:
         # Fall back to raw prompt if the model/chat-template is not compatible.
         return prompt
+
+
+def _clone_tokens(tokens: Any) -> Any:
+    copy_fn = getattr(tokens, "copy", None)
+    if callable(copy_fn):
+        try:
+            return copy_fn()
+        except Exception:  # noqa: BLE001
+            return tokens
+    return tokens
+
+
+def _encode_with_cache(
+    *,
+    tokenizer: Any,
+    state: RuntimeState,
+    formatted_prompt: str,
+    cache_key: str | None,
+) -> tuple[Any, bool]:
+    normalized_key = (cache_key or "").strip()
+    if normalized_key:
+        cached = state.prompt_token_cache.get(normalized_key)
+        if cached is not None:
+            try:
+                state.prompt_cache_order.remove(normalized_key)
+            except ValueError:
+                pass
+            state.prompt_cache_order.append(normalized_key)
+            return _clone_tokens(cached), True
+
+    input_ids = tokenizer.encode(formatted_prompt)
+
+    if normalized_key:
+        state.prompt_token_cache[normalized_key] = _clone_tokens(input_ids)
+        try:
+            state.prompt_cache_order.remove(normalized_key)
+        except ValueError:
+            pass
+        state.prompt_cache_order.append(normalized_key)
+
+        while len(state.prompt_cache_order) > state.prompt_cache_limit:
+            evicted = state.prompt_cache_order.pop(0)
+            state.prompt_token_cache.pop(evicted, None)
+
+    return input_ids, False
 
 
 def _generate_response(og: Any, state: RuntimeState, payload: dict[str, Any]) -> dict[str, Any]:
@@ -166,7 +219,12 @@ def _generate_response(og: Any, state: RuntimeState, payload: dict[str, Any]) ->
         raise RunnerError("runtime_not_initialized")
 
     formatted_prompt = _format_prompt(tokenizer, request["prompt"])
-    input_ids = tokenizer.encode(formatted_prompt)
+    input_ids, prompt_cache_hit = _encode_with_cache(
+        tokenizer=tokenizer,
+        state=state,
+        formatted_prompt=formatted_prompt,
+        cache_key=request["cache_key"],
+    )
 
     max_new_tokens = max(32, int(request["max_new_tokens"]))
     temperature = max(0.0, float(request["temperature"]))
@@ -229,6 +287,7 @@ def _generate_response(og: Any, state: RuntimeState, payload: dict[str, Any]) ->
             "total_latency_ms": total_elapsed_s * 1000.0,
             "tokens_per_second": tokens_per_second,
             "e2e_tokens_per_second": e2e_tokens_per_second,
+            "prompt_cache_hit": prompt_cache_hit,
         },
     }
 
@@ -265,6 +324,27 @@ def _run_daemon() -> int:
         if payload.get("cmd") == "shutdown":
             _emit_line({"ok": True})
             return 0
+
+        batch = payload.get("batch")
+        if batch is not None:
+            if not isinstance(batch, list):
+                _emit_line({"error": "invalid_request_json: batch must be an array"})
+                continue
+
+            responses: list[dict[str, Any]] = []
+            for item in batch:
+                if not isinstance(item, dict):
+                    responses.append({"error": "invalid_request_json: batch item must be a JSON object"})
+                    continue
+                try:
+                    responses.append(_generate_response(og, state, item))
+                except RunnerError as exc:
+                    responses.append({"error": str(exc)})
+                except Exception as exc:  # noqa: BLE001
+                    responses.append({"error": f"onnxruntime_generation_failed: {exc}"})
+
+            _emit_line({"batch": responses})
+            continue
 
         try:
             _emit_line(_generate_response(og, state, payload))

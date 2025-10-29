@@ -134,7 +134,19 @@ public final class SQLiteStore {
             throw StorageError.openDatabase(path: databasePath, message: message)
         }
 
+        configureConnectionDefaults()
         logger.log(.info, "Opened SQLite database at \(databasePath)", category: "storage")
+    }
+
+    private func configureConnectionDefaults() {
+        guard let db else { return }
+
+        // Let readers/writers make forward progress when helper + menu app touch the DB concurrently.
+        _ = sqlite3_busy_timeout(db, 5_000)
+
+        // Prefer WAL mode for better concurrent access patterns. Ignore failures to preserve compatibility.
+        _ = sqlite3_exec(db, "PRAGMA journal_mode=WAL;", nil, nil, nil)
+        _ = sqlite3_exec(db, "PRAGMA synchronous=NORMAL;", nil, nil, nil)
     }
 
     private func createMigrationsTable() throws {

@@ -96,7 +96,16 @@ let package = Package(
         ),
         .executableTarget(
             name: "SenseAssistMenuApp",
-            dependencies: ["CoreContracts", "Storage", "EventKitAdapter"]
+            dependencies: ["CoreContracts", "Storage", "EventKitAdapter"],
+            exclude: ["Info.plist"],
+            linkerSettings: [
+                .unsafeFlags([
+                    "-Xlinker", "-sectcreate",
+                    "-Xlinker", "__TEXT",
+                    "-Xlinker", "__info_plist",
+                    "-Xlinker", "Sources/SenseAssistMenuApp/Info.plist"
+                ])
+            ]
         ),
         .testTarget(
             name: "CoreContractsTests",

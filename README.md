@@ -12,7 +12,7 @@ SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans d
 - Platform: macOS 13+
 - Language: Swift 6
 - Runtime mode: local-first (no cloud dependency required for planning)
-- Test status: 40/40 tests passing (`swift test`)
+- Test status: 42/42 tests passing (`swift test`)
 - Full project + benchmark documentation: `PROJECT_DOCUMENTATION_2026-03-03.md`
 
 ## Why SenseAssist
@@ -37,6 +37,10 @@ SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans d
   - Due-date repair pass when extraction misses required due dates.
 - LLM runtime performance:
   - ONNX runner uses warm daemon mode by default, so model/tokenizer load is reused across requests.
+  - Daemon client uses micro-batching to coalesce concurrent requests into single transport frames.
+  - Requests include app-managed cache keys so runner-side prompt token cache can reuse prefill work for repeated prompts.
+  - Speculative first-pass decoding attempts short generations first, then falls back to full budget only when needed.
+  - Low Power Mode applies power-aware throttling and token scaling to reduce on-device power draw.
   - Operation-specific token budgets cap generation for extraction, due-date repair, Slack edit parsing, and schedule planning.
   - Fallback path keeps one-shot runner behavior if daemon transport fails.
 - Scheduling:
@@ -53,6 +57,7 @@ SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans d
   - Managed Apple Calendar writes through EventKit adapter.
   - Slack `/plan` command handling (`today`, `add`, `move`, `undo`, `help`).
   - Revision and operation persistence for audit and rollback behavior.
+  - Native menu bar onboarding UI for calendar permission setup, account linking, and account enable/disable management (`senseassist-menu`).
 
 ## Architecture
 
@@ -224,6 +229,8 @@ source /absolute/path/to/SenseAssist/.env.oauth.local
 source /absolute/path/to/SenseAssist/.env.onnx.local
 ```
 
+`make sync-all-live` now auto-loads `.env.oauth.local` and `.env.onnx.local` from the repo root when present, so explicit `source` is optional for the default local workflow.
+
 ### 4) Run live sync once
 
 ```bash
@@ -235,7 +242,8 @@ make db-summary
 
 - Live mode:
   - Requires enabled accounts in DB + OAuth env.
-  - Requires `SENSEASSIST_ONNX_MODEL_PATH`.
+  - Requires `SENSEASSIST_ONNX_MODEL_PATH` (from process env or `.env.onnx.local`).
+  - If the default `~/.senseassist` DB path is not writable in your runtime context, SenseAssist falls back to `<current_working_directory>/.senseassist/senseassist.sqlite`.
   - Command: `make sync-all-live`.
 - Demo mode:
   - Uses stub providers and synthetic accounts.
@@ -263,6 +271,14 @@ make db-summary
   - `SENSEASSIST_ONNX_PYTHON` (default: `/usr/bin/python3`).
   - Runner uses warm daemon mode by default to avoid reloading model weights on every request.
   - `SENSEASSIST_ONNX_MAX_NEW_TOKENS`, `SENSEASSIST_ONNX_TEMPERATURE`, `SENSEASSIST_ONNX_TOP_P`.
+  - Optional advanced optimization controls:
+    - `SENSEASSIST_ONNX_SPECULATIVE_DECODING` (default: enabled)
+    - `SENSEASSIST_ONNX_SPECULATIVE_FIRST_PASS_RATIO` (default: `0.55`)
+    - `SENSEASSIST_ONNX_POWER_AWARE_THROTTLING` (default: enabled)
+    - `SENSEASSIST_ONNX_LOW_POWER_TOKEN_SCALE` (default: `0.65`)
+    - `SENSEASSIST_ONNX_LOW_POWER_MIN_INTERVAL_MS` (default: `80`)
+    - `SENSEASSIST_ONNX_DAEMON_BATCH_WINDOW_MS` (default: `8`)
+    - `SENSEASSIST_ONNX_DAEMON_MAX_BATCH_SIZE` (default: `4`)
   - Optional per-intent token caps:
     - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_EXTRACT`
     - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_DUE_REPAIR`
@@ -374,7 +390,6 @@ SenseAssist is built for controlled automation with explicit validation:
 
 ## Current known gaps
 
-- `SenseAssistMenuApp` remains placeholder-level and not production onboarding UX.
 - Full launch-at-login service integration is not complete.
 - Live helper currently wires ONNX runtime path by default (Ollama runtime exists but is not the default live wiring).
 - SQLite encryption-at-rest is not yet implemented.
@@ -386,12 +401,17 @@ SenseAssist is built for controlled automation with explicit validation:
 make help
 make test
 make helper-health
+make menu-health
 make llm-install
 make llm-smoke
 make llm-bench
 make sync-all-demo
 make sync-all-live
 make db-summary
+swift run senseassist-menu
+swift run senseassist-menu --health-check
+swift run senseassist-menu --health-check --require-calendar-ready
+swift run senseassist-menu --request-calendar-access
 ```
 
 ## Project standards

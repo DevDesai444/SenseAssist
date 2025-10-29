@@ -4,14 +4,16 @@ SHELL := /bin/bash
 
 DB_PATH ?= $(HOME)/.senseassist/senseassist.sqlite
 SQLITE3 ?= sqlite3
+LOCAL_ENV_FILES ?= .env.onnx.local .env.oauth.local
 
-.PHONY: help status git-summary test helper-health llm-install llm-smoke llm-bench sync-all-demo sync-all-live db-summary
+.PHONY: help status git-summary test helper-health menu-health llm-install llm-smoke llm-bench sync-all-demo sync-all-live db-summary
 
 help:
 	@echo "SenseAssist commands"
 	@echo "  make status         Run full local verification suite"
 	@echo "  make test           Run Swift tests"
 	@echo "  make helper-health  Run helper health check"
+	@echo "  make menu-health    Run non-interactive menu/calendar health check"
 	@echo "  make llm-install    Install Phi-3.5-mini-instruct-onnx on-device model + env file"
 	@echo "  make llm-smoke      Run on-device ONNX LLM smoke check"
 	@echo "  make llm-bench      Run on-device ONNX LLM benchmark suite"
@@ -19,7 +21,7 @@ help:
 	@echo "  make sync-all-live  Run live multi-account sync (requires OAuth tokens + local ONNX Runtime GenAI model)"
 	@echo "  make db-summary     Print key DB summary tables"
 
-status: git-summary test helper-health sync-all-demo db-summary
+status: git-summary test helper-health menu-health sync-all-demo db-summary
 	@echo ""
 	@echo "Status checks complete."
 
@@ -37,6 +39,11 @@ test:
 helper-health:
 	@echo "== helper health check =="
 	swift run senseassist-helper --health-check
+	@echo ""
+
+menu-health:
+	@echo "== menu health check =="
+	swift run senseassist-menu --health-check
 	@echo ""
 
 llm-install:
@@ -61,6 +68,11 @@ sync-all-demo:
 
 sync-all-live:
 	@echo "== multi-account sync live =="
+	@set -a; \
+	for env_file in $(LOCAL_ENV_FILES); do \
+		if [[ -f "$$env_file" ]]; then source "$$env_file"; fi; \
+	done; \
+	set +a; \
 	swift run senseassist-helper --sync-live-once
 	@echo ""
 
