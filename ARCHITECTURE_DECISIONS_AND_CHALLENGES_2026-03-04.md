@@ -190,7 +190,7 @@ Scope analyzed: full repository (`Sources/`, `Tests/`, `Scripts/`, docs), git hi
 
 ## 5) Open Architectural Gaps (Current State)
 
-1. Menu app remains CLI/placeholder-level onboarding, not full product UI.
+1. (Resolved on March 4, 2026) Menu app now ships a native menu-bar onboarding UI for permissions and account management.
 2. Launch-at-login service lifecycle integration is still incomplete.
 3. Planner still does not fully enforce all sleep-window semantics end-to-end.
 4. SQLite encryption-at-rest is still pending.

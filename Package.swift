@@ -21,14 +21,15 @@ let package = Package(
         .library(name: "OutlookIntegration", targets: ["OutlookIntegration"]),
         .library(name: "EventKitAdapter", targets: ["EventKitAdapter"]),
         .executable(name: "senseassist-helper", targets: ["SenseAssistHelper"]),
-        .executable(name: "senseassist-menu", targets: ["SenseAssistMenuApp"])
+        .executable(name: "senseassist-menu", targets: ["SenseAssistMenuApp"]),
+        .executable(name: "senseassist-schedule-sim", targets: ["SenseAssistScheduleSim"])
     ],
     targets: [
         .target(name: "CoreContracts"),
         .target(name: "Storage", dependencies: ["CoreContracts"]),
         .target(name: "RulesEngine", dependencies: ["CoreContracts"]),
         .target(name: "Planner", dependencies: ["CoreContracts"]),
-        .target(name: "LLMRuntime", dependencies: ["CoreContracts"]),
+        .target(name: "LLMRuntime", dependencies: ["CoreContracts"], exclude: ["LLM_Scheduling_algo"]),
         .target(name: "ParserPipeline", dependencies: ["CoreContracts"]),
         .target(name: "Auth"),
         .target(
@@ -106,6 +107,12 @@ let package = Package(
                     "-Xlinker", "Sources/SenseAssistMenuApp/Info.plist"
                 ])
             ]
+        ),
+        .executableTarget(
+            name: "SenseAssistScheduleSim",
+            dependencies: ["CoreContracts", "LLMRuntime", "Planner"],
+            path: "Sources/LLMRuntime/LLM_Scheduling_algo",
+            exclude: ["README.md", "input.json", ".DS_Store"]
         ),
         .testTarget(
             name: "CoreContractsTests",

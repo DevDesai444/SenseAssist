@@ -293,7 +293,7 @@ private struct SocketAck: Encodable {
 public enum PlanCommand: Sendable, Equatable {
     case today
     case add(title: String, start: Date, durationMinutes: Int)
-    case move(title: String, start: Date, durationMinutes: Int?)
+    case move(title: String, selectedMatchIndex: Int?, start: Date, durationMinutes: Int?)
     case undo
     case help
 }
@@ -312,7 +312,7 @@ public enum PlanCommandParseError: Error, LocalizedError {
         case .invalidAddSyntax:
             return "Invalid add command. Use: add \"Title\" 60m [today|tomorrow] [7:00pm]"
         case .invalidMoveSyntax:
-            return "Invalid move command. Use: move \"Title\" [today|tomorrow] 7:00pm [60m]"
+            return "Invalid move command. Use: move \"Title\" [#2] [today|tomorrow] 7:00pm [60m]"
         case .invalidDuration:
             return "Duration must be provided in minutes, such as 45m"
         case .invalidDateTime:
@@ -374,7 +374,7 @@ public enum PlanCommandParser {
     }
 
     private static func parseMove(_ text: String, now: Date, calendar: Calendar) throws -> PlanCommand {
-        let pattern = #"^move\s+"([^"]+)"\s+(today|tomorrow)\s+([0-9]{1,2}(?::[0-9]{2})?(?:am|pm)?)(?:\s+(\d+)m)?$"#
+        let pattern = #"^move\s+"([^"]+)"(?:\s+#?(\d+))?\s+(today|tomorrow)\s+([0-9]{1,2}(?::[0-9]{2})?(?:am|pm)?)(?:\s+(\d+)m)?$"#
         let match = try firstMatch(pattern: pattern, in: text)
 
         guard let match else {
@@ -382,9 +382,10 @@ public enum PlanCommandParser {
         }
 
         let title = capture(match: match, in: text, group: 1)
-        let dayToken = capture(match: match, in: text, group: 2)
-        let timeToken = capture(match: match, in: text, group: 3)
-        let durationRaw = capture(match: match, in: text, group: 4)
+        let selectedMatchRaw = capture(match: match, in: text, group: 2)
+        let dayToken = capture(match: match, in: text, group: 3)
+        let timeToken = capture(match: match, in: text, group: 4)
+        let durationRaw = capture(match: match, in: text, group: 5)
 
         guard let title, let dayToken, let timeToken else {
             throw PlanCommandParseError.invalidMoveSyntax
@@ -392,8 +393,9 @@ public enum PlanCommandParser {
 
         let start = try resolveDate(dayToken: dayToken, timeToken: timeToken, now: now, calendar: calendar)
         let duration = durationRaw.flatMap(Int.init)
+        let selectedMatchIndex = selectedMatchRaw.flatMap(Int.init)
 
-        return .move(title: title, start: start, durationMinutes: duration)
+        return .move(title: title, selectedMatchIndex: selectedMatchIndex, start: start, durationMinutes: duration)
     }
 
     private static func resolveDate(

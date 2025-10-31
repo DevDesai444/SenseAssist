@@ -1,0 +1,104 @@
+{
+    "configurations": [
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Debug senseassist-helper",
+            "target": "senseassist-helper",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug senseassist-helper"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Release senseassist-helper",
+            "target": "senseassist-helper",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release senseassist-helper"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Debug senseassist-menu",
+            "target": "senseassist-menu",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug senseassist-menu"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Release senseassist-menu",
+            "target": "senseassist-menu",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release senseassist-menu"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Debug planner-bench",
+            "target": "planner-bench",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug planner-bench"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Release planner-bench",
+            "target": "planner-bench",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release planner-bench"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Debug PlannerBench",
+            "target": "PlannerBench",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug PlannerBench"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Release PlannerBench",
+            "target": "PlannerBench",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release PlannerBench"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Debug senseassist-schedule-sim",
+            "target": "senseassist-schedule-sim",
+            "configuration": "debug",
+            "preLaunchTask": "swift: Build Debug senseassist-schedule-sim"
+        },
+        {
+            "type": "swift",
+            "request": "launch",
+            "args": [],
+            "cwd": "${workspaceFolder:SenseAssist}",
+            "name": "Release senseassist-schedule-sim",
+            "target": "senseassist-schedule-sim",
+            "configuration": "release",
+            "preLaunchTask": "swift: Build Release senseassist-schedule-sim"
+        }
+    ]
+}
