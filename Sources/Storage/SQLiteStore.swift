@@ -146,7 +146,8 @@ public final class SQLiteStore {
     }
 
     private func isMigrationApplied(id: String) throws -> Bool {
-        let statement = "SELECT COUNT(*) FROM schema_migrations WHERE id = ?;"
+        let escapedID = id.replacingOccurrences(of: "'", with: "''")
+        let statement = "SELECT COUNT(*) FROM schema_migrations WHERE id = '\(escapedID)';"
         var query: OpaquePointer?
 
         guard sqlite3_prepare_v2(db, statement, -1, &query, nil) == SQLITE_OK else {
@@ -154,8 +155,6 @@ public final class SQLiteStore {
         }
 
         defer { sqlite3_finalize(query) }
-
-        sqlite3_bind_text(query, 1, id, -1, nil)
 
         guard sqlite3_step(query) == SQLITE_ROW else {
             throw StorageError.step(statement: statement, message: sqliteErrorMessage())
