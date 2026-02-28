@@ -44,6 +44,7 @@ let package = Package(
             dependencies: [
                 "CoreContracts",
                 "GmailIntegration",
+                "OutlookIntegration",
                 "ParserPipeline",
                 "RulesEngine",
                 "LLMRuntime",
@@ -83,7 +84,8 @@ let package = Package(
                 "EventKitAdapter",
                 "SlackIntegration",
                 "Ingestion",
-                "GmailIntegration"
+                "GmailIntegration",
+                "OutlookIntegration"
             ]
         ),
         .executableTarget(
@@ -124,6 +126,7 @@ let package = Package(
                 "Ingestion",
                 "CoreContracts",
                 "GmailIntegration",
+                "OutlookIntegration",
                 "LLMRuntime",
                 "Storage"
             ]

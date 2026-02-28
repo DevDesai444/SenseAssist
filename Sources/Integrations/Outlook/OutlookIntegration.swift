@@ -34,10 +34,17 @@ public protocol OutlookClient: Sendable {
 }
 
 public struct StubOutlookClient: OutlookClient {
-    public init() {}
+    private let pages: [(cursor: String?, messages: [OutlookMessage], nextCursor: String?)]
+
+    public init(pages: [(cursor: String?, messages: [OutlookMessage], nextCursor: String?)] = []) {
+        self.pages = pages
+    }
 
     public func fetchMessages(since cursor: String?) async throws -> ([OutlookMessage], nextCursor: String?) {
-        _ = cursor
+        if let page = pages.first(where: { $0.cursor == cursor }) {
+            return (page.messages, page.nextCursor)
+        }
+
         return ([], cursor)
     }
 }
