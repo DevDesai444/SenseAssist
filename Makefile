@@ -5,7 +5,7 @@ SHELL := /bin/bash
 DB_PATH ?= $(HOME)/.senseassist/senseassist.sqlite
 SQLITE3 ?= sqlite3
 
-.PHONY: help status git-summary test helper-health sync-all-demo db-summary
+.PHONY: help status git-summary test helper-health sync-all-demo sync-all-live db-summary
 
 help:
 	@echo "SenseAssist commands"
@@ -13,6 +13,7 @@ help:
 	@echo "  make test           Run Swift tests"
 	@echo "  make helper-health  Run helper health check"
 	@echo "  make sync-all-demo  Run multi-account sync demo"
+	@echo "  make sync-all-live  Run live multi-account sync (requires OAuth tokens + local Ollama)"
 	@echo "  make db-summary     Print key DB summary tables"
 
 status: git-summary test helper-health sync-all-demo db-summary
@@ -38,6 +39,11 @@ helper-health:
 sync-all-demo:
 	@echo "== multi-account sync demo =="
 	swift run senseassist-helper --sync-all-demo
+	@echo ""
+
+sync-all-live:
+	@echo "== multi-account sync live =="
+	swift run senseassist-helper --sync-live-once
 	@echo ""
 
 db-summary:
