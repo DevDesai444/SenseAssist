@@ -35,6 +35,13 @@ actor DeniedCalendarStore: CalendarStore {
         _ = calendar
         return []
     }
+
+    func deleteManagedBlock(blockID: UUID, ekEventID: String?, calendarName: String) async throws {
+        _ = blockID
+        _ = ekEventID
+        _ = calendarName
+        throw CalendarStoreError.permissionDenied
+    }
 }
 
 @Test func parserParsesAddCommand() throws {
@@ -51,6 +58,11 @@ actor DeniedCalendarStore: CalendarStore {
 
     #expect(title == "LeetCode")
     #expect(duration == 60)
+}
+
+@Test func parserParsesUndoCommand() throws {
+    let command = try PlanCommandParser.parse("undo", now: Date())
+    #expect(command == .undo)
 }
 
 @Test func planServiceAddAndTodayFlow() async {
@@ -98,4 +110,16 @@ actor DeniedCalendarStore: CalendarStore {
     let response = await service.handle(commandText: "today")
 
     #expect(response.text.contains("Enable Calendar permission"))
+}
+
+@Test func planServiceUndoRemovesLatestCreatedBlock() async {
+    let store = InMemoryCalendarStore()
+    let service = PlanCommandService(calendarStore: store, initialPlanRevision: 40)
+
+    _ = await service.handle(commandText: "add \"LeetCode\" 60m today 7:00pm")
+    let undoResponse = await service.handle(commandText: "undo")
+    let todayResponse = await service.handle(commandText: "today")
+
+    #expect(undoResponse.text.contains("Undo complete"))
+    #expect(todayResponse.text.contains("No SenseAssist blocks"))
 }

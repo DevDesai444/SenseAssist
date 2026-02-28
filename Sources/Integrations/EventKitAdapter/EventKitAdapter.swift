@@ -27,6 +27,7 @@ public protocol CalendarStore: Sendable {
     func createManagedBlock(_ block: CalendarBlock, calendarName: String) async throws -> CalendarBlock
     func updateManagedBlock(_ block: CalendarBlock, calendarName: String) async throws -> CalendarBlock
     func findManagedBlocks(fuzzyTitle: String, on date: Date?, calendar: Calendar) async throws -> [CalendarBlock]
+    func deleteManagedBlock(blockID: UUID, ekEventID: String?, calendarName: String) async throws
 }
 
 public actor InMemoryCalendarStore: CalendarStore {
@@ -86,6 +87,24 @@ public actor InMemoryCalendarStore: CalendarStore {
         return candidateBlocks
             .filter { $0.title.lowercased().contains(normalized) }
             .sorted { $0.startLocal < $1.startLocal }
+    }
+
+    public func deleteManagedBlock(blockID: UUID, ekEventID: String?, calendarName: String) async throws {
+        _ = calendarName
+
+        if let existing = blocks[blockID] {
+            blocks.removeValue(forKey: blockID)
+            _ = existing
+            return
+        }
+
+        if let ekEventID,
+           let match = blocks.first(where: { $0.value.ekEventID == ekEventID }) {
+            blocks.removeValue(forKey: match.key)
+            return
+        }
+
+        throw CalendarStoreError.eventNotFound
     }
 }
 
@@ -202,6 +221,29 @@ public actor EventKitService: CalendarStore {
             .sorted { $0.startLocal < $1.startLocal }
     }
 
+    public func deleteManagedBlock(blockID: UUID, ekEventID: String?, calendarName: String) async throws {
+        _ = calendarName
+
+        if let ekEventID,
+           let event = store.event(withIdentifier: ekEventID) {
+            try store.remove(event, span: .thisEvent, commit: true)
+            return
+        }
+
+        let managedCalendar = try resolveManagedCalendar(named: "SenseAssist", createIfMissing: false)
+        let now = Date()
+        let start = Calendar.current.date(byAdding: .day, value: -60, to: now) ?? now
+        let end = Calendar.current.date(byAdding: .day, value: 60, to: now) ?? now
+        let predicate = store.predicateForEvents(withStart: start, end: end, calendars: [managedCalendar])
+
+        if let event = store.events(matching: predicate).first(where: { ($0.notes ?? "").contains("block_id=\(blockID.uuidString)") }) {
+            try store.remove(event, span: .thisEvent, commit: true)
+            return
+        }
+
+        throw CalendarStoreError.eventNotFound
+    }
+
     private func resolveManagedCalendar(named name: String, createIfMissing: Bool) throws -> EKCalendar {
         if let existing = store.calendars(for: .event).first(where: { $0.title == name }) {
             return existing
@@ -235,7 +277,7 @@ public actor EventKitService: CalendarStore {
     }
 
     private func eventToBlock(_ event: EKEvent) -> CalendarBlock {
-        let blockID = UUID()
+        let blockID = extractBlockID(from: event.notes) ?? UUID()
         return CalendarBlock(
             blockID: blockID,
             taskID: nil,
@@ -248,6 +290,18 @@ public actor EventKitService: CalendarStore {
             lockLevel: .flexible,
             planRevision: 0
         )
+    }
+
+    private func extractBlockID(from notes: String?) -> UUID? {
+        guard let notes else { return nil }
+        let pattern = #"block_id=([0-9A-Fa-f\-]{36})"#
+        guard let regex = try? NSRegularExpression(pattern: pattern, options: []),
+              let match = regex.firstMatch(in: notes, options: [], range: NSRange(notes.startIndex..<notes.endIndex, in: notes)),
+              let range = Range(match.range(at: 1), in: notes)
+        else {
+            return nil
+        }
+        return UUID(uuidString: String(notes[range]))
     }
 }
 #else
@@ -289,6 +343,13 @@ public actor EventKitService: CalendarStore {
         _ = fuzzyTitle
         _ = date
         _ = calendar
+        throw CalendarStoreError.unsupportedPlatform
+    }
+
+    public func deleteManagedBlock(blockID: UUID, ekEventID: String?, calendarName: String) async throws {
+        _ = blockID
+        _ = ekEventID
+        _ = calendarName
         throw CalendarStoreError.unsupportedPlatform
     }
 }
