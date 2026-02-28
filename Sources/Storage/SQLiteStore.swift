@@ -88,6 +88,34 @@ public final class SQLiteStore {
         }
     }
 
+    public func fetchRows(_ statement: String) throws -> [[String: String]] {
+        try openIfNeeded()
+        var query: OpaquePointer?
+
+        guard sqlite3_prepare_v2(db, statement, -1, &query, nil) == SQLITE_OK else {
+            throw StorageError.prepare(statement: statement, message: sqliteErrorMessage())
+        }
+        defer { sqlite3_finalize(query) }
+
+        var rows: [[String: String]] = []
+        while sqlite3_step(query) == SQLITE_ROW {
+            let columnCount = sqlite3_column_count(query)
+            var row: [String: String] = [:]
+            for index in 0..<columnCount {
+                guard let nameCString = sqlite3_column_name(query, index) else { continue }
+                let name = String(cString: nameCString)
+                if let valueCString = sqlite3_column_text(query, index) {
+                    row[name] = String(cString: valueCString)
+                } else {
+                    row[name] = ""
+                }
+            }
+            rows.append(row)
+        }
+
+        return rows
+    }
+
     private func ensureParentDirectoryExists() throws {
         let url = URL(fileURLWithPath: databasePath)
         let directory = url.deletingLastPathComponent()
@@ -135,7 +163,7 @@ public final class SQLiteStore {
 
                 let appliedAt = ISO8601DateFormatter().string(from: Date())
                 try execute(
-                    "INSERT INTO schema_migrations (id, applied_at_utc) VALUES ('\(migration.id)', '\(appliedAt)');"
+                    "INSERT INTO schema_migrations (id, applied_at_utc) VALUES ('\(escapeSQL(migration.id))', '\(escapeSQL(appliedAt))');"
                 )
                 try execute("COMMIT;")
             } catch {
@@ -167,6 +195,10 @@ public final class SQLiteStore {
         guard let db else { return "No database handle" }
         guard let cString = sqlite3_errmsg(db) else { return "Unknown SQLite error" }
         return String(cString: cString)
+    }
+
+    private func escapeSQL(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "''")
     }
 }
 
@@ -273,6 +305,20 @@ public enum DefaultMigrations {
                   message TEXT NOT NULL,
                   context_json TEXT NOT NULL,
                   created_at_utc TEXT NOT NULL
+                );
+                """
+            ]
+        ),
+        SQLMigration(
+            id: "002_task_sources",
+            statements: [
+                """
+                CREATE TABLE IF NOT EXISTS task_sources (
+                  task_id TEXT NOT NULL,
+                  source TEXT NOT NULL,
+                  message_id TEXT NOT NULL,
+                  confidence REAL NOT NULL,
+                  PRIMARY KEY (task_id, source, message_id)
                 );
                 """
             ]

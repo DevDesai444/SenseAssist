@@ -1,6 +1,8 @@
 import CoreContracts
 import EventKitAdapter
 import Foundation
+import GmailIntegration
+import Ingestion
 import LLMRuntime
 import Orchestration
 import ParserPipeline
@@ -36,6 +38,14 @@ struct SenseAssistHelperMain {
                 Foundation.exit(response.requiresConfirmation ? 2 : 0)
             }
 
+            if ProcessInfo.processInfo.arguments.contains("--gmail-sync-demo") {
+                let summary = try await runGmailSyncDemo(config: config, logger: logger)
+                print(
+                    "Gmail sync summary: fetched=\(summary.fetchedMessages) parsed=\(summary.parsedUpdates) stored_updates=\(summary.storedUpdates) tasks=\(summary.createdOrUpdatedTasks) next_cursor=\(summary.nextCursor ?? "nil")"
+                )
+                Foundation.exit(0)
+            }
+
             logger.log(.info, "SenseAssist helper initialized", category: "helper")
 
             // Minimal runtime loop for Milestone 1 scaffolding.
@@ -60,5 +70,44 @@ struct SenseAssistHelperMain {
         }
 
         return next.joined(separator: " ")
+    }
+
+    private static func runGmailSyncDemo(config: SenseAssistConfiguration, logger: Logging) async throws -> GmailSyncSummary {
+        let store = SQLiteStore(databasePath: config.databasePath, logger: logger)
+        try store.initialize()
+
+        let cursorRepository = ProviderCursorRepository(store: store)
+        let updateRepository = UpdateRepository(store: store)
+        let taskRepository = TaskRepository(store: store)
+        let llmRuntime = StubLLMRuntime()
+
+        let sampleMessage = GmailMessage(
+            messageID: "demo-msg-1",
+            threadID: "demo-thread-1",
+            internalDate: Date(),
+            from: "noreply@buffalo.edu",
+            subject: "CSE312 Assignment posted - due on March 2 at 11:59pm",
+            bodyText: "A new assignment is available. Please submit by due on March 2 at 11:59pm.",
+            links: ["https://ublearns.buffalo.edu"]
+        )
+
+        let client = StubGmailClient(
+            pages: [
+                (cursor: nil, messages: [sampleMessage], nextCursor: "demo-cursor-v1"),
+                (cursor: "demo-cursor-v1", messages: [], nextCursor: "demo-cursor-v1")
+            ]
+        )
+        let service = GmailIngestionService(
+            gmailClient: client,
+            cursorRepository: cursorRepository,
+            updateRepository: updateRepository,
+            taskRepository: taskRepository,
+            llmRuntime: llmRuntime,
+            confidenceThreshold: config.confidenceThreshold
+        )
+
+        let summary = try await service.sync()
+        store.close()
+        return summary
     }
 }

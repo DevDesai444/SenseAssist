@@ -14,6 +14,7 @@ let package = Package(
         .library(name: "LLMRuntime", targets: ["LLMRuntime"]),
         .library(name: "ParserPipeline", targets: ["ParserPipeline"]),
         .library(name: "Orchestration", targets: ["Orchestration"]),
+        .library(name: "Ingestion", targets: ["Ingestion"]),
         .library(name: "SlackIntegration", targets: ["SlackIntegration"]),
         .library(name: "GmailIntegration", targets: ["GmailIntegration"]),
         .library(name: "OutlookIntegration", targets: ["OutlookIntegration"]),
@@ -36,6 +37,17 @@ let package = Package(
                 "RulesEngine",
                 "SlackIntegration",
                 "EventKitAdapter"
+            ]
+        ),
+        .target(
+            name: "Ingestion",
+            dependencies: [
+                "CoreContracts",
+                "GmailIntegration",
+                "ParserPipeline",
+                "RulesEngine",
+                "LLMRuntime",
+                "Storage"
             ]
         ),
         .target(
@@ -69,7 +81,9 @@ let package = Package(
                 "ParserPipeline",
                 "Orchestration",
                 "EventKitAdapter",
-                "SlackIntegration"
+                "SlackIntegration",
+                "Ingestion",
+                "GmailIntegration"
             ]
         ),
         .executableTarget(
@@ -98,6 +112,16 @@ let package = Package(
                 "Orchestration",
                 "CoreContracts",
                 "EventKitAdapter"
+            ]
+        ),
+        .testTarget(
+            name: "IngestionTests",
+            dependencies: [
+                "Ingestion",
+                "CoreContracts",
+                "GmailIntegration",
+                "LLMRuntime",
+                "Storage"
             ]
         )
     ]
