@@ -61,3 +61,70 @@ import Testing
     let count = try audit.count(category: "slack_plan_command")
     #expect(count == 2)
 }
+
+@Test func providerCursorRepositorySupportsMultipleAccounts() throws {
+    let tempDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let dbPath = tempDir.appendingPathComponent("senseassist.sqlite").path
+    let logger = ConsoleLogger(minimumLevel: .error)
+    let store = SQLiteStore(databasePath: dbPath, logger: logger)
+    try store.initialize()
+
+    let cursorRepo = ProviderCursorRepository(store: store)
+    try cursorRepo.upsert(
+        ProviderCursorRecord(
+            provider: .gmail,
+            accountID: "gmail:devdesaiyt@gmail.com",
+            primary: "cursor-a"
+        )
+    )
+    try cursorRepo.upsert(
+        ProviderCursorRecord(
+            provider: .gmail,
+            accountID: "gmail:devdesaiofficial@gmail.com",
+            primary: "cursor-b"
+        )
+    )
+
+    let first = try cursorRepo.get(provider: .gmail, accountID: "gmail:devdesaiyt@gmail.com")
+    let second = try cursorRepo.get(provider: .gmail, accountID: "gmail:devdesaiofficial@gmail.com")
+    let list = try cursorRepo.list(for: .gmail)
+
+    #expect(first?.primary == "cursor-a")
+    #expect(second?.primary == "cursor-b")
+    #expect(list.count == 2)
+}
+
+@Test func accountRepositoryPersistsConnectedAccounts() throws {
+    let tempDir = FileManager.default.temporaryDirectory
+        .appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let dbPath = tempDir.appendingPathComponent("senseassist.sqlite").path
+    let logger = ConsoleLogger(minimumLevel: .error)
+    let store = SQLiteStore(databasePath: dbPath, logger: logger)
+    try store.initialize()
+
+    let accounts = AccountRepository(store: store)
+    try accounts.upsert(
+        ConnectedEmailAccount(
+            accountID: "gmail:devdesaiyt@gmail.com",
+            provider: .gmail,
+            email: "devdesaiyt@gmail.com"
+        )
+    )
+    try accounts.upsert(
+        ConnectedEmailAccount(
+            accountID: "outlook:devchira@buffalo.edu",
+            provider: .outlook,
+            email: "devchira@buffalo.edu"
+        )
+    )
+
+    let all = try accounts.list(enabledOnly: true)
+    #expect(all.count == 2)
+}

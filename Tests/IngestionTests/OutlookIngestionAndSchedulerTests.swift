@@ -34,6 +34,8 @@ import Testing
     )
 
     let service = OutlookIngestionService(
+        accountID: "outlook:devchira@buffalo.edu",
+        accountEmail: "devchira@buffalo.edu",
         outlookClient: client,
         cursorRepository: ProviderCursorRepository(store: store),
         updateRepository: UpdateRepository(store: store),

@@ -7,6 +7,8 @@ import Storage
 import Foundation
 
 public struct GmailSyncSummary: Sendable {
+    public var accountID: String
+    public var accountEmail: String
     public var fetchedMessages: Int
     public var parsedUpdates: Int
     public var storedUpdates: Int
@@ -14,12 +16,16 @@ public struct GmailSyncSummary: Sendable {
     public var nextCursor: String?
 
     public init(
+        accountID: String,
+        accountEmail: String,
         fetchedMessages: Int,
         parsedUpdates: Int,
         storedUpdates: Int,
         createdOrUpdatedTasks: Int,
         nextCursor: String?
     ) {
+        self.accountID = accountID
+        self.accountEmail = accountEmail
         self.fetchedMessages = fetchedMessages
         self.parsedUpdates = parsedUpdates
         self.storedUpdates = storedUpdates
@@ -29,6 +35,8 @@ public struct GmailSyncSummary: Sendable {
 }
 
 public final class GmailIngestionService {
+    private let accountID: String
+    private let accountEmail: String
     private let gmailClient: GmailClient
     private let cursorRepository: ProviderCursorRepository
     private let updateRepository: UpdateRepository
@@ -37,6 +45,8 @@ public final class GmailIngestionService {
     private let confidenceThreshold: Double
 
     public init(
+        accountID: String,
+        accountEmail: String,
         gmailClient: GmailClient,
         cursorRepository: ProviderCursorRepository,
         updateRepository: UpdateRepository,
@@ -44,6 +54,8 @@ public final class GmailIngestionService {
         llmRuntime: LLMRuntimeClient,
         confidenceThreshold: Double = 0.80
     ) {
+        self.accountID = accountID
+        self.accountEmail = accountEmail
         self.gmailClient = gmailClient
         self.cursorRepository = cursorRepository
         self.updateRepository = updateRepository
@@ -53,7 +65,7 @@ public final class GmailIngestionService {
     }
 
     public func sync() async throws -> GmailSyncSummary {
-        let existingCursor = try cursorRepository.get(provider: .gmail)?.primary
+        let existingCursor = try cursorRepository.get(provider: .gmail, accountID: accountID)?.primary
         let (messages, nextCursor) = try await gmailClient.fetchMessages(since: existingCursor)
 
         let parsed = messages.flatMap { message in
@@ -69,6 +81,11 @@ public final class GmailIngestionService {
                     links: message.links
                 )
             )
+            .map {
+                var parsed = $0
+                parsed.card.accountID = accountID
+                return parsed
+            }
         }
 
         let updateCards = parsed.map(\.card)
@@ -87,10 +104,14 @@ public final class GmailIngestionService {
         let storedTasks = try taskRepository.upsert(tasks)
 
         if let nextCursor {
-            try cursorRepository.upsert(ProviderCursorRecord(provider: .gmail, primary: nextCursor))
+            try cursorRepository.upsert(
+                ProviderCursorRecord(provider: .gmail, accountID: accountID, primary: nextCursor)
+            )
         }
 
         return GmailSyncSummary(
+            accountID: accountID,
+            accountEmail: accountEmail,
             fetchedMessages: messages.count,
             parsedUpdates: updateCards.count,
             storedUpdates: storedUpdates,

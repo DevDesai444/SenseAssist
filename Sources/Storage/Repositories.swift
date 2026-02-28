@@ -8,11 +8,13 @@ public enum StorageProvider: String, Sendable {
 
 public struct ProviderCursorRecord: Sendable {
     public var provider: StorageProvider
+    public var accountID: String
     public var primary: String
     public var secondary: String?
 
-    public init(provider: StorageProvider, primary: String, secondary: String? = nil) {
+    public init(provider: StorageProvider, accountID: String, primary: String, secondary: String? = nil) {
         self.provider = provider
+        self.accountID = accountID
         self.primary = primary
         self.secondary = secondary
     }
@@ -25,38 +27,78 @@ public final class ProviderCursorRepository {
         self.store = store
     }
 
-    public func get(provider: StorageProvider) throws -> ProviderCursorRecord? {
+    public func get(provider: StorageProvider, accountID: String) throws -> ProviderCursorRecord? {
         let sql = """
-        SELECT provider, cursor_primary, cursor_secondary
+        SELECT provider, account_id, cursor_primary, cursor_secondary
         FROM provider_cursors
         WHERE provider = '\(escape(provider.rawValue))'
+          AND account_id = '\(escape(accountID))'
         LIMIT 1;
         """
 
         guard let row = try store.fetchRows(sql).first,
               let providerName = row["provider"],
+              let storedAccountID = row["account_id"],
               let primary = row["cursor_primary"],
               let parsedProvider = StorageProvider(rawValue: providerName)
         else {
             return nil
         }
 
-        return ProviderCursorRecord(provider: parsedProvider, primary: primary, secondary: row["cursor_secondary"])
+        return ProviderCursorRecord(
+            provider: parsedProvider,
+            accountID: storedAccountID,
+            primary: primary,
+            secondary: row["cursor_secondary"]
+        )
     }
 
     public func upsert(_ record: ProviderCursorRecord) throws {
         let secondarySQL = record.secondary.map { "'\(escape($0))'" } ?? "NULL"
 
         let sql = """
-        INSERT INTO provider_cursors (provider, cursor_primary, cursor_secondary, updated_at_utc)
-        VALUES ('\(escape(record.provider.rawValue))', '\(escape(record.primary))', \(secondarySQL), '\(timestamp())')
-        ON CONFLICT(provider) DO UPDATE SET
+        INSERT INTO provider_cursors (provider, account_id, cursor_primary, cursor_secondary, updated_at_utc)
+        VALUES (
+          '\(escape(record.provider.rawValue))',
+          '\(escape(record.accountID))',
+          '\(escape(record.primary))',
+          \(secondarySQL),
+          '\(timestamp())'
+        )
+        ON CONFLICT(provider, account_id) DO UPDATE SET
           cursor_primary = excluded.cursor_primary,
           cursor_secondary = excluded.cursor_secondary,
           updated_at_utc = excluded.updated_at_utc;
         """
 
         try store.execute(sql)
+    }
+
+    public func list(for provider: StorageProvider) throws -> [ProviderCursorRecord] {
+        let sql = """
+        SELECT provider, account_id, cursor_primary, cursor_secondary
+        FROM provider_cursors
+        WHERE provider = '\(escape(provider.rawValue))'
+        ORDER BY account_id;
+        """
+
+        return try store.fetchRows(sql).compactMap { row in
+            guard
+                let providerName = row["provider"],
+                let accountID = row["account_id"],
+                let primary = row["cursor_primary"],
+                let parsedProvider = StorageProvider(rawValue: providerName)
+            else {
+                return nil
+            }
+
+            return ProviderCursorRecord(
+                provider: parsedProvider,
+                accountID: accountID,
+                primary: primary,
+                secondary: row["cursor_secondary"]
+            )
+        }
     }
 
     private func escape(_ value: String) -> String {
@@ -88,13 +130,14 @@ public final class UpdateRepository {
 
             let sql = """
             INSERT OR IGNORE INTO updates (
-              update_id, source, message_id, thread_id,
+              update_id, source, account_id, message_id, thread_id,
               received_at_utc, sender, subject, body_text,
               links_json, tags_json, parser_method, parse_confidence,
               content_hash, requires_confirmation, created_at_utc
             ) VALUES (
               '\(escape(update.updateID.uuidString))',
               '\(escape(update.source.rawValue))',
+              '\(escape(update.accountID))',
               '\(escape(update.providerIDs.messageID))',
               \(nullable(update.providerIDs.threadID)),
               '\(escape(received))',
@@ -116,6 +159,20 @@ public final class UpdateRepository {
             inserted += changes
         }
         return inserted
+    }
+
+    public func count(source: UpdateSource? = nil, accountID: String? = nil) throws -> Int {
+        var predicates: [String] = []
+        if let source {
+            predicates.append("source = '\(escape(source.rawValue))'")
+        }
+        if let accountID {
+            predicates.append("account_id = '\(escape(accountID))'")
+        }
+
+        let whereClause = predicates.isEmpty ? "" : " WHERE " + predicates.joined(separator: " AND ")
+        let sql = "SELECT COUNT(*) AS n FROM updates\(whereClause);"
+        return try store.fetchRows(sql).first?["n"].flatMap(Int.init) ?? 0
     }
 
     private func escape(_ value: String) -> String {
@@ -148,6 +205,7 @@ public final class TaskRepository {
             let due = task.dueAtLocal.map { "'\(escape(ISO8601DateFormatter().string(from: $0)))'" } ?? "NULL"
             let now = ISO8601DateFormatter().string(from: Date())
             let dedupeKey = buildDedupeKey(task)
+            let incomingTaskID = escape(task.taskID.uuidString)
 
             let sql = """
             INSERT INTO tasks (
@@ -156,7 +214,7 @@ public final class TaskRepository {
               stress_weight, feasibility_state, status,
               dedupe_key, created_at_utc, updated_at_utc
             ) VALUES (
-              '\(escape(task.taskID.uuidString))',
+              '\(incomingTaskID)',
               '\(escape(task.title))',
               '\(escape(task.category.rawValue))',
               \(due),
@@ -170,7 +228,7 @@ public final class TaskRepository {
               '\(escape(now))',
               '\(escape(now))'
             )
-            ON CONFLICT(task_id) DO UPDATE SET
+            ON CONFLICT(dedupe_key) DO UPDATE SET
               title = excluded.title,
               category = excluded.category,
               due_at_local = excluded.due_at_local,
@@ -186,13 +244,14 @@ public final class TaskRepository {
 
             try store.execute(sql)
 
-            try store.execute("DELETE FROM task_sources WHERE task_id = '\(escape(task.taskID.uuidString))';")
+            let resolvedTaskID = try resolvedTaskIDForDedupeKey(dedupeKey) ?? task.taskID.uuidString
             for source in task.sources {
                 let sourceSQL = """
-                INSERT OR REPLACE INTO task_sources (task_id, source, message_id, confidence)
+                INSERT OR REPLACE INTO task_sources (task_id, source, account_id, message_id, confidence)
                 VALUES (
-                  '\(escape(task.taskID.uuidString))',
+                  '\(escape(resolvedTaskID))',
                   '\(escape(source.source.rawValue))',
+                  '\(escape(source.accountID))',
                   '\(escape(source.messageID))',
                   \(source.confidence)
                 );
@@ -214,6 +273,88 @@ public final class TaskRepository {
     private func buildDedupeKey(_ task: TaskItem) -> String {
         let due = task.dueAtLocal.map { ISO8601DateFormatter().string(from: $0) } ?? "none"
         return "\(task.category.rawValue)|\(task.title.lowercased())|\(due)"
+    }
+
+    private func resolvedTaskIDForDedupeKey(_ dedupeKey: String) throws -> String? {
+        let sql = """
+        SELECT task_id
+        FROM tasks
+        WHERE dedupe_key = '\(escape(dedupeKey))'
+        LIMIT 1;
+        """
+
+        return try store.fetchRows(sql).first?["task_id"]
+    }
+
+    private func escape(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "''")
+    }
+}
+
+public struct ConnectedEmailAccount: Sendable, Equatable {
+    public var accountID: String
+    public var provider: StorageProvider
+    public var email: String
+    public var isEnabled: Bool
+
+    public init(accountID: String, provider: StorageProvider, email: String, isEnabled: Bool = true) {
+        self.accountID = accountID
+        self.provider = provider
+        self.email = email
+        self.isEnabled = isEnabled
+    }
+}
+
+public final class AccountRepository {
+    private let store: SQLiteStore
+
+    public init(store: SQLiteStore) {
+        self.store = store
+    }
+
+    public func upsert(_ account: ConnectedEmailAccount) throws {
+        let now = ISO8601DateFormatter().string(from: Date())
+        let enabled = account.isEnabled ? 1 : 0
+        let sql = """
+        INSERT INTO accounts (account_id, provider, email, is_enabled, created_at_utc, updated_at_utc)
+        VALUES (
+          '\(escape(account.accountID))',
+          '\(escape(account.provider.rawValue))',
+          '\(escape(account.email))',
+          \(enabled),
+          '\(now)',
+          '\(now)'
+        )
+        ON CONFLICT(account_id) DO UPDATE SET
+          provider = excluded.provider,
+          email = excluded.email,
+          is_enabled = excluded.is_enabled,
+          updated_at_utc = excluded.updated_at_utc;
+        """
+        try store.execute(sql)
+    }
+
+    public func list(enabledOnly: Bool = false) throws -> [ConnectedEmailAccount] {
+        let whereClause = enabledOnly ? " WHERE is_enabled = 1" : ""
+        let sql = """
+        SELECT account_id, provider, email, is_enabled
+        FROM accounts\(whereClause)
+        ORDER BY provider, email;
+        """
+
+        return try store.fetchRows(sql).compactMap { row in
+            guard
+                let accountID = row["account_id"],
+                let providerRaw = row["provider"],
+                let provider = StorageProvider(rawValue: providerRaw),
+                let email = row["email"]
+            else {
+                return nil
+            }
+
+            let isEnabled = row["is_enabled"].flatMap(Int.init).map { $0 != 0 } ?? false
+            return ConnectedEmailAccount(accountID: accountID, provider: provider, email: email, isEnabled: isEnabled)
+        }
     }
 
     private func escape(_ value: String) -> String {

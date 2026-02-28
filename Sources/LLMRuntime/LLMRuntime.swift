@@ -33,7 +33,14 @@ public struct StubLLMRuntime: LLMRuntimeClient {
                 minDailyMinutes: 30,
                 priority: 1,
                 stressWeight: 0.5,
-                sources: [TaskSource(source: update.source, messageID: update.providerIDs.messageID, confidence: update.parseConfidence)]
+                sources: [
+                    TaskSource(
+                        source: update.source,
+                        accountID: update.accountID,
+                        messageID: update.providerIDs.messageID,
+                        confidence: update.parseConfidence
+                    )
+                ]
             )
         }
     }
