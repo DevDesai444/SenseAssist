@@ -33,7 +33,14 @@ struct SenseAssistHelperMain {
             }
 
             if let command = extractPlanCommand(arguments: ProcessInfo.processInfo.arguments) {
-                let service = PlanCommandService(calendarStore: EventKitService())
+                let auditStore = SQLiteStore(databasePath: config.databasePath, logger: logger)
+                try auditStore.initialize()
+                let auditRepository = AuditLogRepository(store: auditStore)
+
+                let service = PlanCommandService(
+                    calendarStore: EventKitService(),
+                    auditLogRepository: auditRepository
+                )
                 let response = await service.handle(commandText: command, now: Date())
                 print(response.text)
                 Foundation.exit(response.requiresConfirmation ? 2 : 0)

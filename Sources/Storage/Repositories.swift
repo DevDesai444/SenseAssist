@@ -220,3 +220,44 @@ public final class TaskRepository {
         value.replacingOccurrences(of: "'", with: "''")
     }
 }
+
+public final class AuditLogRepository: @unchecked Sendable {
+    private let store: SQLiteStore
+
+    public init(store: SQLiteStore) {
+        self.store = store
+    }
+
+    public func log(category: String, severity: String, message: String, context: [String: String] = [:]) throws {
+        let contextJSON: String
+        if let data = try? JSONEncoder().encode(context), let json = String(data: data, encoding: .utf8) {
+            contextJSON = json
+        } else {
+            contextJSON = "{}"
+        }
+
+        let sql = """
+        INSERT INTO audit_log (log_id, category, severity, message, context_json, created_at_utc)
+        VALUES (
+          '\(UUID().uuidString)',
+          '\(escape(category))',
+          '\(escape(severity))',
+          '\(escape(message))',
+          '\(escape(contextJSON))',
+          '\(ISO8601DateFormatter().string(from: Date()))'
+        );
+        """
+
+        try store.execute(sql)
+    }
+
+    public func count(category: String? = nil) throws -> Int {
+        let whereClause = category.map { " WHERE category = '\(escape($0))'" } ?? ""
+        let sql = "SELECT COUNT(*) AS n FROM audit_log\(whereClause);"
+        return try store.fetchRows(sql).first?["n"].flatMap(Int.init) ?? 0
+    }
+
+    private func escape(_ value: String) -> String {
+        value.replacingOccurrences(of: "'", with: "''")
+    }
+}

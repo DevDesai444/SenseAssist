@@ -36,7 +36,8 @@ let package = Package(
                 "Planner",
                 "RulesEngine",
                 "SlackIntegration",
-                "EventKitAdapter"
+                "EventKitAdapter",
+                "Storage"
             ]
         ),
         .target(
