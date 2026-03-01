@@ -1,6 +1,16 @@
 import CoreContracts
 import Foundation
 
+public struct GmailSyncCursor: Codable, Equatable, Sendable {
+    public var internalDateSeconds: Int
+    public var messageID: String?
+
+    public init(internalDateSeconds: Int, messageID: String? = nil) {
+        self.internalDateSeconds = internalDateSeconds
+        self.messageID = messageID
+    }
+}
+
 public struct GmailMessage: Sendable {
     public var messageID: String
     public var threadID: String?
@@ -30,7 +40,7 @@ public struct GmailMessage: Sendable {
 }
 
 public protocol GmailClient: Sendable {
-    func fetchMessages(since cursor: String?) async throws -> ([GmailMessage], nextCursor: String?)
+    func fetchMessages(since cursor: GmailSyncCursor?) async throws -> ([GmailMessage], nextCursor: GmailSyncCursor?)
 }
 
 public enum GmailClientError: Error, LocalizedError {
@@ -61,48 +71,68 @@ public struct GoogleGmailAPIClient: GmailClient {
         self.maxResults = max(1, min(maxResults, 500))
     }
 
-    public func fetchMessages(since cursor: String?) async throws -> ([GmailMessage], nextCursor: String?) {
-        var components = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")
-        var queryItems: [URLQueryItem] = [
-            URLQueryItem(name: "maxResults", value: "\(maxResults)")
-        ]
+    public func fetchMessages(since cursor: GmailSyncCursor?) async throws -> ([GmailMessage], nextCursor: GmailSyncCursor?) {
+        var pageToken: String?
+        var fetched: [GmailMessage] = []
+        var seenMessageIDs = Set<String>()
 
-        if let cursor,
-           let sinceSeconds = Int(cursor), sinceSeconds > 0 {
-            queryItems.append(URLQueryItem(name: "q", value: "after:\(sinceSeconds)"))
-        }
+        repeat {
+            var components = URLComponents(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages")
+            var queryItems: [URLQueryItem] = [
+                URLQueryItem(name: "maxResults", value: "\(maxResults)")
+            ]
 
-        components?.queryItems = queryItems
-        guard let listURL = components?.url else {
-            throw GmailClientError.invalidURL
-        }
+            if let cursor {
+                // Use a 1-second overlap to avoid dropping same-second arrivals.
+                let safeAfter = max(0, cursor.internalDateSeconds - 1)
+                queryItems.append(URLQueryItem(name: "q", value: "after:\(safeAfter)"))
+            }
 
-        let listData = try await authorizedGET(listURL)
-        let listResponse = try JSONDecoder().decode(GmailListResponse.self, from: listData)
+            if let pageToken {
+                queryItems.append(URLQueryItem(name: "pageToken", value: pageToken))
+            }
 
-        let ids = listResponse.messages ?? []
-        var messages: [GmailMessage] = []
-        var maxInternalDateSeconds = Int(cursor ?? "0") ?? 0
-
-        for id in ids {
-            let detailURL = URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/\(id.id)?format=full")
-            guard let detailURL else {
+            components?.queryItems = queryItems
+            guard let listURL = components?.url else {
                 throw GmailClientError.invalidURL
             }
 
-            let detailData = try await authorizedGET(detailURL)
-            let detail = try JSONDecoder().decode(GmailMessageResponse.self, from: detailData)
-            guard let gmailMessage = detail.toDomainMessage() else {
-                continue
+            let listData = try await authorizedGET(listURL)
+            let listResponse = try JSONDecoder().decode(GmailListResponse.self, from: listData)
+
+            let ids = listResponse.messages ?? []
+            for id in ids {
+                let detailURL = URL(string: "https://gmail.googleapis.com/gmail/v1/users/me/messages/\(id.id)?format=full")
+                guard let detailURL else {
+                    throw GmailClientError.invalidURL
+                }
+
+                let detailData = try await authorizedGET(detailURL)
+                let detail = try JSONDecoder().decode(GmailMessageResponse.self, from: detailData)
+                guard let gmailMessage = detail.toDomainMessage() else {
+                    continue
+                }
+
+                guard seenMessageIDs.insert(gmailMessage.messageID).inserted else {
+                    continue
+                }
+
+                if isAfterCursor(gmailMessage, cursor: cursor) {
+                    fetched.append(gmailMessage)
+                }
             }
 
-            messages.append(gmailMessage)
-            let seconds = Int(gmailMessage.internalDate.timeIntervalSince1970)
-            maxInternalDateSeconds = max(maxInternalDateSeconds, seconds)
+            pageToken = listResponse.nextPageToken
+        } while pageToken != nil
+
+        fetched.sort(by: messageTupleCompare)
+
+        var nextCursor = cursor
+        for message in fetched {
+            nextCursor = maxCursor(nextCursor, message: message)
         }
 
-        let nextCursor = maxInternalDateSeconds > 0 ? String(maxInternalDateSeconds) : cursor
-        return (messages, nextCursor)
+        return (fetched, nextCursor)
     }
 
     private func authorizedGET(_ url: URL) async throws -> Data {
@@ -122,16 +152,67 @@ public struct GoogleGmailAPIClient: GmailClient {
 
         return data
     }
+
+    private func isAfterCursor(_ message: GmailMessage, cursor: GmailSyncCursor?) -> Bool {
+        guard let cursor else {
+            return true
+        }
+
+        let seconds = Int(message.internalDate.timeIntervalSince1970)
+        if seconds > cursor.internalDateSeconds {
+            return true
+        }
+
+        if seconds < cursor.internalDateSeconds {
+            return false
+        }
+
+        let cursorMessageID = cursor.messageID ?? ""
+        return message.messageID > cursorMessageID
+    }
+
+    private func messageTupleCompare(lhs: GmailMessage, rhs: GmailMessage) -> Bool {
+        let lSeconds = Int(lhs.internalDate.timeIntervalSince1970)
+        let rSeconds = Int(rhs.internalDate.timeIntervalSince1970)
+
+        if lSeconds != rSeconds {
+            return lSeconds < rSeconds
+        }
+
+        return lhs.messageID < rhs.messageID
+    }
+
+    private func maxCursor(_ current: GmailSyncCursor?, message: GmailMessage) -> GmailSyncCursor {
+        let seconds = Int(message.internalDate.timeIntervalSince1970)
+        let candidate = GmailSyncCursor(internalDateSeconds: seconds, messageID: message.messageID)
+        guard let current else {
+            return candidate
+        }
+
+        if candidate.internalDateSeconds > current.internalDateSeconds {
+            return candidate
+        }
+
+        if candidate.internalDateSeconds < current.internalDateSeconds {
+            return current
+        }
+
+        if (candidate.messageID ?? "") > (current.messageID ?? "") {
+            return candidate
+        }
+
+        return current
+    }
 }
 
 public struct StubGmailClient: GmailClient {
-    private let pages: [(cursor: String?, messages: [GmailMessage], nextCursor: String?)]
+    private let pages: [(cursor: GmailSyncCursor?, messages: [GmailMessage], nextCursor: GmailSyncCursor?)]
 
-    public init(pages: [(cursor: String?, messages: [GmailMessage], nextCursor: String?)] = []) {
+    public init(pages: [(cursor: GmailSyncCursor?, messages: [GmailMessage], nextCursor: GmailSyncCursor?)] = []) {
         self.pages = pages
     }
 
-    public func fetchMessages(since cursor: String?) async throws -> ([GmailMessage], nextCursor: String?) {
+    public func fetchMessages(since cursor: GmailSyncCursor?) async throws -> ([GmailMessage], nextCursor: GmailSyncCursor?) {
         if let page = pages.first(where: { $0.cursor == cursor }) {
             return (page.messages, page.nextCursor)
         }
@@ -146,6 +227,7 @@ private struct GmailListResponse: Decodable {
     }
 
     let messages: [MessageRef]?
+    let nextPageToken: String?
 }
 
 private struct GmailMessageResponse: Decodable {

@@ -36,6 +36,7 @@ public final class MultiAccountSyncCoordinator {
     private let confidenceThreshold: Double
     private let gmailClientFactory: (ConnectedEmailAccount) -> GmailClient?
     private let outlookClientFactory: (ConnectedEmailAccount) -> OutlookClient?
+    private let autoPlanningService: AutoPlanningService?
 
     public init(
         accountRepository: AccountRepository,
@@ -45,7 +46,8 @@ public final class MultiAccountSyncCoordinator {
         llmRuntime: LLMRuntimeClient,
         confidenceThreshold: Double,
         gmailClientFactory: @escaping (ConnectedEmailAccount) -> GmailClient?,
-        outlookClientFactory: @escaping (ConnectedEmailAccount) -> OutlookClient?
+        outlookClientFactory: @escaping (ConnectedEmailAccount) -> OutlookClient?,
+        autoPlanningService: AutoPlanningService? = nil
     ) {
         self.accountRepository = accountRepository
         self.cursorRepository = cursorRepository
@@ -55,6 +57,7 @@ public final class MultiAccountSyncCoordinator {
         self.confidenceThreshold = confidenceThreshold
         self.gmailClientFactory = gmailClientFactory
         self.outlookClientFactory = outlookClientFactory
+        self.autoPlanningService = autoPlanningService
     }
 
     public func syncAllEnabledAccounts() async throws -> MultiAccountSyncResult {
@@ -75,7 +78,8 @@ public final class MultiAccountSyncCoordinator {
                     updateRepository: updateRepository,
                     taskRepository: taskRepository,
                     llmRuntime: llmRuntime,
-                    confidenceThreshold: confidenceThreshold
+                    confidenceThreshold: confidenceThreshold,
+                    autoPlanningService: autoPlanningService
                 )
                 gmailSummaries.append(try await service.sync())
             case .outlook:
@@ -88,7 +92,8 @@ public final class MultiAccountSyncCoordinator {
                     updateRepository: updateRepository,
                     taskRepository: taskRepository,
                     llmRuntime: llmRuntime,
-                    confidenceThreshold: confidenceThreshold
+                    confidenceThreshold: confidenceThreshold,
+                    autoPlanningService: autoPlanningService
                 )
                 outlookSummaries.append(try await service.sync())
             }

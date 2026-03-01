@@ -43,6 +43,7 @@ public final class GmailIngestionService {
     private let taskRepository: TaskRepository
     private let llmRuntime: LLMRuntimeClient
     private let confidenceThreshold: Double
+    private let autoPlanningService: AutoPlanningService?
 
     public init(
         accountID: String,
@@ -52,7 +53,8 @@ public final class GmailIngestionService {
         updateRepository: UpdateRepository,
         taskRepository: TaskRepository,
         llmRuntime: LLMRuntimeClient,
-        confidenceThreshold: Double = 0.80
+        confidenceThreshold: Double = 0.80,
+        autoPlanningService: AutoPlanningService? = nil
     ) {
         self.accountID = accountID
         self.accountEmail = accountEmail
@@ -62,10 +64,12 @@ public final class GmailIngestionService {
         self.taskRepository = taskRepository
         self.llmRuntime = llmRuntime
         self.confidenceThreshold = confidenceThreshold
+        self.autoPlanningService = autoPlanningService
     }
 
     public func sync() async throws -> GmailSyncSummary {
-        let existingCursor = try cursorRepository.get(provider: .gmail, accountID: accountID)?.primary
+        let existingCursorRecord = try cursorRepository.get(provider: .gmail, accountID: accountID)
+        let existingCursor = parseCursor(existingCursorRecord)
         let (messages, nextCursor) = try await gmailClient.fetchMessages(since: existingCursor)
 
         let parsed = messages.flatMap { message in
@@ -102,10 +106,18 @@ public final class GmailIngestionService {
 
         let storedUpdates = try updateRepository.upsert(updateCards)
         let storedTasks = try taskRepository.upsert(tasks)
+        if let autoPlanningService {
+            _ = try await autoPlanningService.regenerate(now: Date(), trigger: "gmail_sync")
+        }
 
         if let nextCursor {
             try cursorRepository.upsert(
-                ProviderCursorRecord(provider: .gmail, accountID: accountID, primary: nextCursor)
+                ProviderCursorRecord(
+                    provider: .gmail,
+                    accountID: accountID,
+                    primary: String(nextCursor.internalDateSeconds),
+                    secondary: nextCursor.messageID
+                )
             )
         }
 
@@ -116,7 +128,21 @@ public final class GmailIngestionService {
             parsedUpdates: updateCards.count,
             storedUpdates: storedUpdates,
             createdOrUpdatedTasks: storedTasks,
-            nextCursor: nextCursor
+            nextCursor: nextCursor.map { "\($0.internalDateSeconds)" }
         )
+    }
+
+    private func parseCursor(_ record: ProviderCursorRecord?) -> GmailSyncCursor? {
+        guard let record else {
+            return nil
+        }
+
+        // Backward compatibility: if old cursor format was stored as plain seconds, keep using it.
+        let seconds = Int(record.primary) ?? 0
+        guard seconds > 0 else {
+            return nil
+        }
+
+        return GmailSyncCursor(internalDateSeconds: seconds, messageID: record.secondary)
     }
 }

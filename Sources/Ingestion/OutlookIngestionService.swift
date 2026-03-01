@@ -43,6 +43,7 @@ public final class OutlookIngestionService {
     private let taskRepository: TaskRepository
     private let llmRuntime: LLMRuntimeClient
     private let confidenceThreshold: Double
+    private let autoPlanningService: AutoPlanningService?
 
     public init(
         accountID: String,
@@ -52,7 +53,8 @@ public final class OutlookIngestionService {
         updateRepository: UpdateRepository,
         taskRepository: TaskRepository,
         llmRuntime: LLMRuntimeClient,
-        confidenceThreshold: Double = 0.80
+        confidenceThreshold: Double = 0.80,
+        autoPlanningService: AutoPlanningService? = nil
     ) {
         self.accountID = accountID
         self.accountEmail = accountEmail
@@ -62,10 +64,12 @@ public final class OutlookIngestionService {
         self.taskRepository = taskRepository
         self.llmRuntime = llmRuntime
         self.confidenceThreshold = confidenceThreshold
+        self.autoPlanningService = autoPlanningService
     }
 
     public func sync() async throws -> OutlookSyncSummary {
-        let existingCursor = try cursorRepository.get(provider: .outlook, accountID: accountID)?.primary
+        let existingCursorRecord = try cursorRepository.get(provider: .outlook, accountID: accountID)
+        let existingCursor = parseCursor(existingCursorRecord)
         let (messages, nextCursor) = try await outlookClient.fetchMessages(since: existingCursor)
 
         let parsed = messages.flatMap { message in
@@ -102,10 +106,18 @@ public final class OutlookIngestionService {
 
         let storedUpdates = try updateRepository.upsert(updateCards)
         let storedTasks = try taskRepository.upsert(tasks)
+        if let autoPlanningService {
+            _ = try await autoPlanningService.regenerate(now: Date(), trigger: "outlook_sync")
+        }
 
         if let nextCursor {
             try cursorRepository.upsert(
-                ProviderCursorRecord(provider: .outlook, accountID: accountID, primary: nextCursor)
+                ProviderCursorRecord(
+                    provider: .outlook,
+                    accountID: accountID,
+                    primary: nextCursor.receivedDateTimeISO8601,
+                    secondary: nextCursor.messageID
+                )
             )
         }
 
@@ -116,7 +128,20 @@ public final class OutlookIngestionService {
             parsedUpdates: updateCards.count,
             storedUpdates: storedUpdates,
             createdOrUpdatedTasks: storedTasks,
-            nextCursor: nextCursor
+            nextCursor: nextCursor?.receivedDateTimeISO8601
         )
+    }
+
+    private func parseCursor(_ record: ProviderCursorRecord?) -> OutlookSyncCursor? {
+        guard let record else {
+            return nil
+        }
+
+        // Backward compatibility: older runs stored ISO-8601 in primary only.
+        guard ISO8601DateFormatter().date(from: record.primary) != nil else {
+            return nil
+        }
+
+        return OutlookSyncCursor(receivedDateTimeISO8601: record.primary, messageID: record.secondary)
     }
 }

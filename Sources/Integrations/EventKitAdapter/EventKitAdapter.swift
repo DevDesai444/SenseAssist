@@ -121,8 +121,11 @@ public enum EventKitPermissionState: String, Sendable {
 public actor EventKitService: CalendarStore {
     private let store = EKEventStore()
     private let managedMarker = "[SenseAssistManaged]"
+    private var activeManagedCalendarName: String
 
-    public init() {}
+    public init(defaultManagedCalendarName: String = "SenseAssist") {
+        self.activeManagedCalendarName = defaultManagedCalendarName
+    }
 
     public func currentPermissionState() -> EventKitPermissionState {
         if #available(macOS 14.0, *) {
@@ -146,11 +149,12 @@ public actor EventKitService: CalendarStore {
     }
 
     public func ensureManagedCalendar(named name: String) async throws {
+        activeManagedCalendarName = name
         _ = try resolveManagedCalendar(named: name, createIfMissing: true)
     }
 
     public func fetchManagedBlocks(on date: Date, calendar: Calendar) async throws -> [CalendarBlock] {
-        let managedCalendar = try resolveManagedCalendar(named: "SenseAssist", createIfMissing: false)
+        let managedCalendar = try resolveManagedCalendar(named: activeManagedCalendarName, createIfMissing: false)
         let dayStart = calendar.startOfDay(for: date)
         guard let dayEnd = calendar.date(byAdding: .day, value: 1, to: dayStart) else {
             return []
@@ -164,6 +168,7 @@ public actor EventKitService: CalendarStore {
     }
 
     public func createManagedBlock(_ block: CalendarBlock, calendarName: String) async throws -> CalendarBlock {
+        activeManagedCalendarName = calendarName
         let calendar = try resolveManagedCalendar(named: calendarName, createIfMissing: true)
 
         let event = EKEvent(eventStore: store)
@@ -182,6 +187,7 @@ public actor EventKitService: CalendarStore {
     }
 
     public func updateManagedBlock(_ block: CalendarBlock, calendarName: String) async throws -> CalendarBlock {
+        activeManagedCalendarName = calendarName
         guard let eventID = block.ekEventID, let event = store.event(withIdentifier: eventID) else {
             throw CalendarStoreError.eventNotFound
         }
@@ -199,7 +205,7 @@ public actor EventKitService: CalendarStore {
     }
 
     public func findManagedBlocks(fuzzyTitle: String, on date: Date?, calendar: Calendar) async throws -> [CalendarBlock] {
-        let managedCalendar = try resolveManagedCalendar(named: "SenseAssist", createIfMissing: false)
+        let managedCalendar = try resolveManagedCalendar(named: activeManagedCalendarName, createIfMissing: false)
 
         let now = Date()
         let searchStart: Date
@@ -222,7 +228,7 @@ public actor EventKitService: CalendarStore {
     }
 
     public func deleteManagedBlock(blockID: UUID, ekEventID: String?, calendarName: String) async throws {
-        _ = calendarName
+        activeManagedCalendarName = calendarName
 
         if let ekEventID,
            let event = store.event(withIdentifier: ekEventID) {
@@ -230,7 +236,7 @@ public actor EventKitService: CalendarStore {
             return
         }
 
-        let managedCalendar = try resolveManagedCalendar(named: "SenseAssist", createIfMissing: false)
+        let managedCalendar = try resolveManagedCalendar(named: activeManagedCalendarName, createIfMissing: false)
         let now = Date()
         let start = Calendar.current.date(byAdding: .day, value: -60, to: now) ?? now
         let end = Calendar.current.date(byAdding: .day, value: 60, to: now) ?? now
@@ -310,7 +316,9 @@ public enum EventKitPermissionState: String, Sendable {
 }
 
 public actor EventKitService: CalendarStore {
-    public init() {}
+    public init(defaultManagedCalendarName: String = "SenseAssist") {
+        _ = defaultManagedCalendarName
+    }
 
     public func currentPermissionState() -> EventKitPermissionState {
         .denied
