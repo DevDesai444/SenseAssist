@@ -51,7 +51,9 @@ let package = Package(
                 "ParserPipeline",
                 "RulesEngine",
                 "LLMRuntime",
-                "Storage"
+                "Storage",
+                "Planner",
+                "EventKitAdapter"
             ]
         ),
         .target(
@@ -94,7 +96,7 @@ let package = Package(
         ),
         .executableTarget(
             name: "SenseAssistMenuApp",
-            dependencies: ["CoreContracts", "Storage"]
+            dependencies: ["CoreContracts", "Storage", "EventKitAdapter"]
         ),
         .testTarget(
             name: "CoreContractsTests",
