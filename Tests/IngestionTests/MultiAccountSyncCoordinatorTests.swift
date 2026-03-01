@@ -47,7 +47,18 @@ import Testing
                 bodyText: "Account \(account.email) update due on March 2 at 11:59pm.",
                 links: ["https://ublearns.buffalo.edu"]
             )
-            return StubGmailClient(pages: [(cursor: nil, messages: [message], nextCursor: "\(account.accountID)-c1")])
+            return StubGmailClient(
+                pages: [
+                    (
+                        cursor: nil,
+                        messages: [message],
+                        nextCursor: GmailSyncCursor(
+                            internalDateSeconds: Int(message.internalDate.timeIntervalSince1970),
+                            messageID: message.messageID
+                        )
+                    )
+                ]
+            )
         },
         outlookClientFactory: { account in
             guard account.provider == .outlook else { return nil }
@@ -60,7 +71,18 @@ import Testing
                 bodyText: "Account \(account.email) quiz due by March 3 at 5pm.",
                 links: ["https://ublearns.buffalo.edu"]
             )
-            return StubOutlookClient(pages: [(cursor: nil, messages: [message], nextCursor: "\(account.accountID)-c1")])
+            return StubOutlookClient(
+                pages: [
+                    (
+                        cursor: nil,
+                        messages: [message],
+                        nextCursor: OutlookSyncCursor(
+                            receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+                            messageID: message.messageID
+                        )
+                    )
+                ]
+            )
         }
     )
 

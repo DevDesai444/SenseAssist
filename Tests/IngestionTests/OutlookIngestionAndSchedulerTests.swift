@@ -28,8 +28,25 @@ import Testing
 
     let client = StubOutlookClient(
         pages: [
-            (cursor: nil, messages: [message], nextCursor: "o-cursor-1"),
-            (cursor: "o-cursor-1", messages: [], nextCursor: "o-cursor-1")
+            (
+                cursor: nil,
+                messages: [message],
+                nextCursor: OutlookSyncCursor(
+                    receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+                    messageID: message.messageID
+                )
+            ),
+            (
+                cursor: OutlookSyncCursor(
+                    receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+                    messageID: message.messageID
+                ),
+                messages: [],
+                nextCursor: OutlookSyncCursor(
+                    receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+                    messageID: message.messageID
+                )
+            )
         ]
     )
 
