@@ -4,4 +4,7 @@
 Models/
 .env.onnx.local
 .env.oauth.local
+.env.oauth.local.save
 .venv-onnx/
+.codex-cache/
+.codex-home/
