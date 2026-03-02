@@ -94,6 +94,18 @@ public enum FeasibilityState: String, Codable, Sendable {
     case infeasible
 }
 
+public struct SchedulePlan: Codable, Equatable, Sendable {
+    public var blocks: [CalendarBlock]
+    public var feasibilityState: FeasibilityState
+    public var unscheduledTaskIDs: [UUID]
+
+    public init(blocks: [CalendarBlock], feasibilityState: FeasibilityState, unscheduledTaskIDs: [UUID]) {
+        self.blocks = blocks
+        self.feasibilityState = feasibilityState
+        self.unscheduledTaskIDs = unscheduledTaskIDs
+    }
+}
+
 public struct TaskSource: Codable, Equatable, Sendable {
     public var source: UpdateSource
     public var accountID: String
