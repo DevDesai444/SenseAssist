@@ -1,6 +1,7 @@
 import CoreContracts
 import EventKitAdapter
 import Foundation
+import LLMRuntime
 import Planner
 import Storage
 
@@ -31,6 +32,7 @@ public final class AutoPlanningService {
     private let planRevisionRepository: PlanRevisionRepository
     private let operationRepository: OperationRepository?
     private let calendarStore: CalendarStore
+    private let schedulerLLMRuntime: LLMRuntimeClient?
     private let managedCalendarName: String
     private let constraints: PlannerConstraints
     private let calendar: Calendar
@@ -40,6 +42,7 @@ public final class AutoPlanningService {
         planRevisionRepository: PlanRevisionRepository,
         operationRepository: OperationRepository? = nil,
         calendarStore: CalendarStore,
+        schedulerLLMRuntime: LLMRuntimeClient? = nil,
         managedCalendarName: String = "SenseAssist",
         constraints: PlannerConstraints,
         calendar: Calendar = .current
@@ -48,6 +51,7 @@ public final class AutoPlanningService {
         self.planRevisionRepository = planRevisionRepository
         self.operationRepository = operationRepository
         self.calendarStore = calendarStore
+        self.schedulerLLMRuntime = schedulerLLMRuntime
         self.managedCalendarName = managedCalendarName
         self.constraints = constraints
         self.calendar = calendar
@@ -67,7 +71,33 @@ public final class AutoPlanningService {
             planRevision: nextRevision,
             calendar: calendar
         )
-        let result = PlannerEngine.plan(input)
+        let result: SchedulePlan
+        if let schedulerLLMRuntime {
+            do {
+                result = try await schedulerLLMRuntime.inferSchedulePlan(
+                    date: now,
+                    tasks: activeTasks,
+                    existingBlocks: existingBlocks,
+                    constraints: constraints,
+                    planRevision: nextRevision,
+                    timeZoneIdentifier: calendar.timeZone.identifier
+                )
+            } catch {
+                let fallback = PlannerEngine.plan(input)
+                result = SchedulePlan(
+                    blocks: fallback.blocks,
+                    feasibilityState: fallback.feasibilityState,
+                    unscheduledTaskIDs: fallback.unscheduledTaskIDs
+                )
+            }
+        } else {
+            let fallback = PlannerEngine.plan(input)
+            result = SchedulePlan(
+                blocks: fallback.blocks,
+                feasibilityState: fallback.feasibilityState,
+                unscheduledTaskIDs: fallback.unscheduledTaskIDs
+            )
+        }
 
         let existingKeys = Set(existingBlocks.map(blockDiffKey))
         let plannedKeys = Set(result.blocks.map(blockDiffKey))
