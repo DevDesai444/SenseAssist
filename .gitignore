@@ -3,4 +3,5 @@
 .swiftpm/
 Models/
 .env.onnx.local
+.env.oauth.local
 .venv-onnx/

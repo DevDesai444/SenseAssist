@@ -1,4 +1,5 @@
 import Foundation
+import LocalAuthentication
 import Security
 
 public enum KeychainCredentialError: Error, LocalizedError {
@@ -23,9 +24,11 @@ public enum KeychainCredentialError: Error, LocalizedError {
 
 public final class KeychainCredentialStore: CredentialStore {
     private let serviceName: String
+    private let allowUserInteraction: Bool
 
-    public init(serviceName: String = "com.senseassist.oauth") {
+    public init(serviceName: String = "com.senseassist.oauth", allowUserInteraction: Bool = true) {
         self.serviceName = serviceName
+        self.allowUserInteraction = allowUserInteraction
     }
 
     public func save(_ credential: OAuthCredential, provider: CredentialProvider, accountID: String) throws {
@@ -37,12 +40,13 @@ public final class KeychainCredentialStore: CredentialStore {
             kSecAttrService as String: serviceName,
             kSecAttrAccount as String: keychainAccount
         ]
+        let effectiveQuery = applyAuthenticationUIPolicy(query)
 
         let attributes: [String: Any] = [
             kSecValueData as String: data
         ]
 
-        let updateStatus = SecItemUpdate(query as CFDictionary, attributes as CFDictionary)
+        let updateStatus = SecItemUpdate(effectiveQuery as CFDictionary, attributes as CFDictionary)
         if updateStatus == errSecSuccess {
             return
         }
@@ -51,7 +55,7 @@ public final class KeychainCredentialStore: CredentialStore {
             throw KeychainCredentialError.saveFailed(status: updateStatus)
         }
 
-        var addQuery = query
+        var addQuery = effectiveQuery
         addQuery[kSecValueData as String] = data
 
         let addStatus = SecItemAdd(addQuery as CFDictionary, nil)
@@ -70,9 +74,10 @@ public final class KeychainCredentialStore: CredentialStore {
             kSecReturnData as String: true,
             kSecMatchLimit as String: kSecMatchLimitOne
         ]
+        let effectiveQuery = applyAuthenticationUIPolicy(query)
 
         var item: CFTypeRef?
-        let status = SecItemCopyMatching(query as CFDictionary, &item)
+        let status = SecItemCopyMatching(effectiveQuery as CFDictionary, &item)
 
         if status == errSecItemNotFound {
             return nil
@@ -108,5 +113,18 @@ public final class KeychainCredentialStore: CredentialStore {
 
     private func keychainAccountName(provider: CredentialProvider, accountID: String) -> String {
         "\(provider.rawValue)|\(accountID)"
+    }
+
+    private func applyAuthenticationUIPolicy(_ query: [String: Any]) -> [String: Any] {
+        guard !allowUserInteraction else {
+            return query
+        }
+
+        let context = LAContext()
+        context.interactionNotAllowed = true
+
+        var adjusted = query
+        adjusted[kSecUseAuthenticationContext as String] = context
+        return adjusted
     }
 }
