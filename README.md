@@ -276,8 +276,33 @@ make sync-all-live
 
 ### Required for live sync: ONNX Runtime GenAI
 
+Finalized model for this repo:
+
+- `microsoft/Phi-3.5-mini-instruct-onnx`
+
+One-command install + setup:
+
 ```bash
-python3 -m pip install onnxruntime-genai
+make llm-install
+source ./.env.onnx.local
+make llm-smoke
+```
+
+This installs Python dependencies, downloads the model into:
+
+- `Models/Phi-3.5-mini-instruct-onnx`
+
+It also creates a local Python venv for ONNX runtime dependencies:
+
+- `.venv-onnx`
+
+and writes local runtime exports to:
+
+- `.env.onnx.local`
+
+Manual env configuration is still supported:
+
+```bash
 export SENSEASSIST_ONNX_MODEL_PATH="/absolute/path/to/model"
 export SENSEASSIST_ONNX_RUNNER="/Users/DEVDESAI1/Desktop/University_at_Buffalo/Projects/SenseAssist/Scripts/onnx_genai_runner.py"
 export SENSEASSIST_ONNX_PYTHON="/usr/bin/python3"
@@ -299,7 +324,7 @@ export SENSEASSIST_ONNX_TOP_P="0.95"
 - `Sources/ParserPipeline`: deterministic message parsing/classification/splitting.
 - `Sources/RulesEngine`: validation firewall for edits and extracted updates.
 - `Sources/Planner`: scheduling heuristics and feasibility checks.
-- `Sources/LLMRuntime`: ONNX extraction/edit parsing runtime (with optional Ollama adapter for dev experimentation).
+- `Sources/LLMRuntime`: ONNX extraction/edit parsing runtime (live path uses on-device ONNX Runtime GenAI).
 - `Sources/Ingestion`: Gmail/Outlook services, multi-account coordinator, adaptive scheduler, auto-planning apply.
 - `Sources/Integrations/Slack`: Socket Mode transport + command parsing.
 - `Sources/Integrations/Gmail`: Gmail list/get + cursor logic.
