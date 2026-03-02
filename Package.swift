@@ -119,6 +119,10 @@ let package = Package(
             dependencies: ["ParserPipeline", "CoreContracts"]
         ),
         .testTarget(
+            name: "AuthTests",
+            dependencies: ["Auth"]
+        ),
+        .testTarget(
             name: "OrchestrationTests",
             dependencies: [
                 "Orchestration",
