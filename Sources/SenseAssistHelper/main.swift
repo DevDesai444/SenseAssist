@@ -427,6 +427,7 @@ struct SenseAssistHelperMain {
         let store = SQLiteStore(databasePath: config.databasePath, logger: logger)
         try store.initialize()
         defer { store.close() }
+        let environment = ProcessInfo.processInfo.environment
 
         let accountRepository = AccountRepository(store: store)
         let enabledAccounts = try accountRepository.list(enabledOnly: true)
@@ -450,22 +451,24 @@ struct SenseAssistHelperMain {
         for account in enabledAccounts {
             switch account.provider {
             case .gmail:
-                if let credential = try loadCredential(
+                if let credential = try await loadOrRefreshCredential(
                     store: credentialStore,
                     provider: .gmail,
                     accountID: account.accountID,
-                    email: account.email
+                    email: account.email,
+                    environment: environment
                 ) {
                     gmailTokens[account.accountID] = credential.accessToken
                 } else {
                     skippedAccounts.append("gmail \(account.email): missing OAuth token")
                 }
             case .outlook:
-                if let credential = try loadCredential(
+                if let credential = try await loadOrRefreshCredential(
                     store: credentialStore,
                     provider: .outlook,
                     accountID: account.accountID,
-                    email: account.email
+                    email: account.email,
+                    environment: environment
                 ) {
                     outlookTokens[account.accountID] = credential.accessToken
                 } else {
@@ -570,7 +573,64 @@ struct SenseAssistHelperMain {
         )
     }
 
-    private static func loadCredential(
+    private static func loadOrRefreshCredential(
+        store: CredentialStore,
+        provider: CredentialProvider,
+        accountID: String,
+        email: String,
+        environment: [String: String]
+    ) async throws -> OAuthCredential? {
+        if let existing = try loadCredentialCandidate(
+            store: store,
+            provider: provider,
+            accountID: accountID,
+            email: email
+        ) {
+            if shouldRefresh(existing),
+               let refreshToken = existing.refreshToken,
+               let refreshed = try await refreshCredential(
+                   provider: provider,
+                   refreshToken: refreshToken,
+                   environment: environment
+               ) {
+                let credential = OAuthCredential(
+                    accessToken: refreshed.accessToken,
+                    refreshToken: refreshed.refreshToken ?? refreshToken,
+                    expiresAtUTC: refreshed.expiresAtUTC
+                )
+                try? store.save(credential, provider: provider, accountID: accountID)
+                return credential
+            }
+
+            if !existing.accessToken.isEmpty {
+                return existing
+            }
+        }
+
+        if let refreshToken = refreshTokenFromEnvironment(
+            provider: provider,
+            accountID: accountID,
+            email: email,
+            environment: environment
+        ),
+           let refreshed = try await refreshCredential(
+               provider: provider,
+               refreshToken: refreshToken,
+               environment: environment
+           ) {
+            let credential = OAuthCredential(
+                accessToken: refreshed.accessToken,
+                refreshToken: refreshed.refreshToken ?? refreshToken,
+                expiresAtUTC: refreshed.expiresAtUTC
+            )
+            try? store.save(credential, provider: provider, accountID: accountID)
+            return credential
+        }
+
+        return nil
+    }
+
+    private static func loadCredentialCandidate(
         store: CredentialStore,
         provider: CredentialProvider,
         accountID: String,
@@ -587,6 +647,134 @@ struct SenseAssistHelperMain {
         }
 
         return nil
+    }
+
+    private static func shouldRefresh(_ credential: OAuthCredential, now: Date = Date()) -> Bool {
+        if credential.accessToken.isEmpty {
+            return true
+        }
+
+        guard let expiresAtUTC = credential.expiresAtUTC else {
+            return false
+        }
+
+        return expiresAtUTC <= now.addingTimeInterval(300)
+    }
+
+    private static func refreshTokenFromEnvironment(
+        provider: CredentialProvider,
+        accountID: String,
+        email: String,
+        environment: [String: String]
+    ) -> String? {
+        let keys = [
+            refreshTokenEnvKey(provider: provider, accountKey: accountID),
+            refreshTokenEnvKey(provider: provider, accountKey: email)
+        ]
+
+        for key in keys {
+            if let token = environment[key], !token.isEmpty {
+                return token
+            }
+        }
+
+        return nil
+    }
+
+    private static func refreshTokenEnvKey(provider: CredentialProvider, accountKey: String) -> String {
+        let normalizedAccount = accountKey
+            .replacingOccurrences(of: "[^A-Za-z0-9]", with: "_", options: .regularExpression)
+            .uppercased()
+        return "SENSEASSIST_REFRESH_TOKEN_\(provider.rawValue.uppercased())_\(normalizedAccount)"
+    }
+
+    private static func refreshCredential(
+        provider: CredentialProvider,
+        refreshToken: String,
+        environment: [String: String]
+    ) async throws -> OAuthCredential? {
+        switch provider {
+        case .gmail:
+            guard let clientID = environment["SENSEASSIST_GMAIL_CLIENT_ID"], !clientID.isEmpty,
+                  let clientSecret = environment["SENSEASSIST_GMAIL_CLIENT_SECRET"], !clientSecret.isEmpty
+            else {
+                return nil
+            }
+
+            return try await requestRefreshedCredential(
+                tokenURL: URL(string: "https://oauth2.googleapis.com/token")!,
+                fields: [
+                    "client_id": clientID,
+                    "client_secret": clientSecret,
+                    "refresh_token": refreshToken,
+                    "grant_type": "refresh_token"
+                ]
+            )
+
+        case .outlook:
+            guard let clientID = environment["SENSEASSIST_OUTLOOK_CLIENT_ID"], !clientID.isEmpty,
+                  let clientSecret = environment["SENSEASSIST_OUTLOOK_CLIENT_SECRET"], !clientSecret.isEmpty
+            else {
+                return nil
+            }
+
+            let tenant = environment["SENSEASSIST_OUTLOOK_TENANT"] ?? "common"
+            return try await requestRefreshedCredential(
+                tokenURL: URL(string: "https://login.microsoftonline.com/\(tenant)/oauth2/v2.0/token")!,
+                fields: [
+                    "client_id": clientID,
+                    "client_secret": clientSecret,
+                    "refresh_token": refreshToken,
+                    "grant_type": "refresh_token",
+                    "scope": "https://graph.microsoft.com/Mail.Read offline_access"
+                ]
+            )
+
+        case .slackBot, .slackApp:
+            return nil
+        }
+    }
+
+    private static func requestRefreshedCredential(
+        tokenURL: URL,
+        fields: [String: String]
+    ) async throws -> OAuthCredential? {
+        var request = URLRequest(url: tokenURL)
+        request.httpMethod = "POST"
+        request.setValue("application/x-www-form-urlencoded", forHTTPHeaderField: "Content-Type")
+        var components = URLComponents()
+        components.queryItems = fields.map { URLQueryItem(name: $0.key, value: $0.value) }
+        request.httpBody = components.percentEncodedQuery?.data(using: .utf8)
+
+        let (data, response) = try await URLSession.shared.data(for: request)
+        guard let http = response as? HTTPURLResponse, (200..<300).contains(http.statusCode) else {
+            return nil
+        }
+
+        let decoder = JSONDecoder()
+        let payload = try decoder.decode(OAuthRefreshPayload.self, from: data)
+        guard !payload.accessToken.isEmpty else {
+            return nil
+        }
+
+        let expiresAtUTC = payload.expiresIn.map { Date().addingTimeInterval(TimeInterval(max(0, $0 - 60))) }
+        return OAuthCredential(
+            accessToken: payload.accessToken,
+            refreshToken: payload.refreshToken,
+            expiresAtUTC: expiresAtUTC
+        )
+    }
+}
+
+private struct OAuthRefreshPayload: Decodable {
+    let accessToken: String
+    let refreshToken: String?
+    let expiresIn: Int?
+
+    enum CodingKeys: String, CodingKey {
+        case accessToken = "access_token"
+        case refreshToken = "refresh_token"
+        case expiresIn = "expires_in"
     }
 }
 
