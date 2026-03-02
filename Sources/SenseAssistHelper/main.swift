@@ -501,6 +501,7 @@ struct SenseAssistHelperMain {
                 planRevisionRepository: planRevisionRepository,
                 operationRepository: operationRepository,
                 calendarStore: eventKitService,
+                schedulerLLMRuntime: llmRuntime,
                 managedCalendarName: "SenseAssist",
                 constraints: config.constraints
             )
