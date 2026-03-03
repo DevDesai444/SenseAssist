@@ -176,6 +176,17 @@ public final class UpdateRepository {
         return try store.fetchRows(sql).first?["n"].flatMap(Int.init) ?? 0
     }
 
+    public func countRequiresConfirmation(accountID: String? = nil) throws -> Int {
+        var predicates = ["requires_confirmation = 1"]
+        if let accountID {
+            predicates.append("account_id = '\(escape(accountID))'")
+        }
+
+        let whereClause = " WHERE " + predicates.joined(separator: " AND ")
+        let sql = "SELECT COUNT(*) AS n FROM updates\(whereClause);"
+        return try store.fetchRows(sql).first?["n"].flatMap(Int.init) ?? 0
+    }
+
     private func escape(_ value: String) -> String {
         value.replacingOccurrences(of: "'", with: "''")
     }
@@ -286,7 +297,42 @@ public final class TaskRepository {
         """
 
         let formatter = ISO8601DateFormatter()
-        return try store.fetchRows(sql).compactMap { row in
+        let taskRows = try store.fetchRows(sql)
+        if taskRows.isEmpty {
+            return []
+        }
+
+        let sourceRows = try store.fetchRows(
+            """
+            SELECT task_id, source, account_id, message_id, confidence
+            FROM task_sources;
+            """
+        )
+        var sourcesByTaskID: [String: [TaskSource]] = [:]
+        for row in sourceRows {
+            guard
+                let taskID = row["task_id"],
+                let sourceRaw = row["source"],
+                let source = UpdateSource(rawValue: sourceRaw),
+                let accountID = row["account_id"],
+                let messageID = row["message_id"],
+                let confidenceRaw = row["confidence"],
+                let confidence = Double(confidenceRaw)
+            else {
+                continue
+            }
+
+            sourcesByTaskID[taskID, default: []].append(
+                TaskSource(
+                    source: source,
+                    accountID: accountID,
+                    messageID: messageID,
+                    confidence: min(max(confidence, 0.0), 1.0)
+                )
+            )
+        }
+
+        return taskRows.compactMap { row in
             guard
                 let taskIDRaw = row["task_id"],
                 let taskID = UUID(uuidString: taskIDRaw),
@@ -324,7 +370,7 @@ public final class TaskRepository {
                 priority: priority,
                 stressWeight: stressWeight,
                 feasibilityState: feasibility,
-                sources: [],
+                sources: sourcesByTaskID[taskIDRaw] ?? [],
                 status: status
             )
         }

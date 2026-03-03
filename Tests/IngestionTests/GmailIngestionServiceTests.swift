@@ -57,6 +57,10 @@ import Testing
 
     let taskCount = try TaskRepository(store: store).count()
     #expect(taskCount == 1)
+    let activeTasks = try TaskRepository(store: store).listActive()
+    #expect(activeTasks.count == 1)
+    #expect(activeTasks[0].sources.count == 1)
+    #expect(activeTasks[0].sources[0].confidence >= 0.80)
 }
 
 @Test func gmailSyncSkipsLowConfidenceTaskExtraction() async throws {
@@ -107,6 +111,7 @@ import Testing
     #expect(summary.fetchedMessages == 1)
     #expect(summary.storedUpdates == 1)
     #expect(summary.createdOrUpdatedTasks == 0)
+    #expect(try UpdateRepository(store: store).countRequiresConfirmation(accountID: "gmail:devdesaiofficial@gmail.com") == 1)
 }
 
 @Test func gmailSyncSupportsMultipleAccountsWithSameMessageID() async throws {

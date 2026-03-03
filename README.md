@@ -13,6 +13,7 @@ SenseAssist ingests Gmail and Outlook updates, extracts actionable work, plans d
 - Language: Swift 6
 - Runtime mode: local-first (no cloud dependency required for planning)
 - Test status: 39/39 tests passing (`swift test`)
+- Full project + benchmark documentation: `PROJECT_DOCUMENTATION_2026-03-03.md`
 
 ## Why SenseAssist
 
@@ -102,7 +103,7 @@ flowchart TB
 - `Sources/Orchestration`: `/plan` command parser/service and undo flow.
 - `Sources/SenseAssistHelper`: runtime entrypoint and background loop.
 - `Tests`: unit/integration tests across modules.
-- `Scripts`: model install and smoke-test utilities.
+- `Scripts`: model install, smoke-test, and benchmark utilities.
 
 ## Quick start
 
@@ -126,7 +127,10 @@ swift run senseassist-helper --health-check
 make llm-install
 source ./.env.onnx.local
 make llm-smoke
+make llm-bench
 ```
+
+Benchmark reports are written to `Docs/benchmarks/` (JSON + Markdown).
 
 ### 3) Configure OAuth credentials (env-first)
 
@@ -307,6 +311,7 @@ make test
 make helper-health
 make llm-install
 make llm-smoke
+make llm-bench
 make sync-all-demo
 make sync-all-live
 make db-summary

@@ -1,4 +1,5 @@
 import CoreContracts
+import EventKitAdapter
 import Foundation
 import GmailIntegration
 import Ingestion
@@ -98,6 +99,101 @@ import Testing
     #expect(try updates.count(source: .gmail, accountID: "gmail:devdesaiofficial@gmail.com") == 1)
     #expect(try updates.count(source: .gmail, accountID: "gmail:devdesaiyttt@gmail.com") == 1)
     #expect(try updates.count(source: .outlook, accountID: "outlook:devchira@buffalo.edu") == 1)
+}
+
+@Test func multiAccountCoordinatorTriggersAutoPlanningOncePerSyncCycle() async throws {
+    let tempDir = FileManager.default.temporaryDirectory.appendingPathComponent(UUID().uuidString)
+    try FileManager.default.createDirectory(at: tempDir, withIntermediateDirectories: true)
+    defer { try? FileManager.default.removeItem(at: tempDir) }
+
+    let dbPath = tempDir.appendingPathComponent("senseassist.sqlite").path
+    let logger = ConsoleLogger(minimumLevel: .error)
+    let store = SQLiteStore(databasePath: dbPath, logger: logger)
+    try store.initialize()
+
+    let accountRepository = AccountRepository(store: store)
+    try accountRepository.upsert(
+        ConnectedEmailAccount(accountID: "gmail:student.one@example.com", provider: .gmail, email: "student.one@example.com")
+    )
+    try accountRepository.upsert(
+        ConnectedEmailAccount(accountID: "outlook:student.two@example.com", provider: .outlook, email: "student.two@example.com")
+    )
+
+    let schedulerRuntime = CountingSchedulerRuntime()
+    let autoPlanning = AutoPlanningService(
+        taskRepository: TaskRepository(store: store),
+        planRevisionRepository: PlanRevisionRepository(store: store),
+        operationRepository: OperationRepository(store: store),
+        calendarStore: InMemoryCalendarStore(),
+        schedulerLLMRuntime: schedulerRuntime,
+        schedulerMode: .llmOnly,
+        dailyRoutineTasks: [],
+        constraints: PlannerConstraints()
+    )
+
+    let coordinator = MultiAccountSyncCoordinator(
+        accountRepository: accountRepository,
+        cursorRepository: ProviderCursorRepository(store: store),
+        updateRepository: UpdateRepository(store: store),
+        taskRepository: TaskRepository(store: store),
+        llmRuntime: StubLLMRuntime(),
+        confidenceThreshold: 0.80,
+        gmailClientFactory: { account in
+            guard account.provider == .gmail else { return nil }
+            let message = GmailMessage(
+                messageID: "gmail-sync-message",
+                threadID: "thread-\(account.accountID)",
+                internalDate: Date(),
+                from: "noreply@buffalo.edu",
+                subject: "CSE312 assignment due on March 5",
+                bodyText: "Assignment due on March 5 at 11:59pm.",
+                links: []
+            )
+            return StubGmailClient(
+                pages: [
+                    (
+                        cursor: nil,
+                        messages: [message],
+                        nextCursor: GmailSyncCursor(
+                            internalDateSeconds: Int(message.internalDate.timeIntervalSince1970),
+                            messageID: message.messageID
+                        )
+                    )
+                ]
+            )
+        },
+        outlookClientFactory: { account in
+            guard account.provider == .outlook else { return nil }
+            let message = OutlookMessage(
+                messageID: "outlook-sync-message",
+                conversationID: "conv-\(account.accountID)",
+                receivedDateTime: Date(),
+                from: "noreply@buffalo.edu",
+                subject: "CSE331 quiz due by March 4",
+                bodyText: "Quiz due by March 4 at 5pm.",
+                links: []
+            )
+            return StubOutlookClient(
+                pages: [
+                    (
+                        cursor: nil,
+                        messages: [message],
+                        nextCursor: OutlookSyncCursor(
+                            receivedDateTimeISO8601: ISO8601DateFormatter().string(from: message.receivedDateTime),
+                            messageID: message.messageID
+                        )
+                    )
+                ]
+            )
+        },
+        autoPlanningService: autoPlanning
+    )
+
+    let result = try await coordinator.syncAllEnabledAccounts()
+
+    #expect(result.failures.isEmpty)
+    #expect(await schedulerRuntime.scheduleCallCount() == 1)
+    #expect(try PlanRevisionRepository(store: store).latestRevisionID() == 1)
 }
 
 @Test func multiAccountCoordinatorContinuesAfterSingleAccountSyncFailure() async throws {
@@ -211,5 +307,42 @@ private enum StubClientError: Error, LocalizedError, Sendable {
         case let .forcedFailure(message):
             return message
         }
+    }
+}
+
+private actor CountingSchedulerRuntime: LLMRuntimeClient {
+    private var scheduleCalls = 0
+
+    func scheduleCallCount() -> Int {
+        scheduleCalls
+    }
+
+    func inferExtractTasks(from updates: [UpdateCard]) async throws -> [TaskItem] {
+        _ = updates
+        return []
+    }
+
+    func inferSlackEdit(messageText: String, expectedPlanRevision: Int) async throws -> EditOperation {
+        _ = messageText
+        _ = expectedPlanRevision
+        throw LLMRuntimeError.unsupportedPrompt
+    }
+
+    func inferSchedulePlan(
+        date: Date,
+        tasks: [TaskItem],
+        existingBlocks: [CalendarBlock],
+        constraints: PlannerConstraints,
+        planRevision: Int,
+        timeZoneIdentifier: String
+    ) async throws -> SchedulePlan {
+        _ = date
+        _ = tasks
+        _ = existingBlocks
+        _ = constraints
+        _ = planRevision
+        _ = timeZoneIdentifier
+        scheduleCalls += 1
+        return SchedulePlan(blocks: [], feasibilityState: .atRisk, unscheduledTaskIDs: tasks.map(\.taskID))
     }
 }

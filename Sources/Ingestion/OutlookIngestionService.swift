@@ -43,7 +43,6 @@ public final class OutlookIngestionService {
     private let taskRepository: TaskRepository
     private let llmRuntime: LLMRuntimeClient
     private let confidenceThreshold: Double
-    private let autoPlanningService: AutoPlanningService?
 
     public init(
         accountID: String,
@@ -53,8 +52,7 @@ public final class OutlookIngestionService {
         updateRepository: UpdateRepository,
         taskRepository: TaskRepository,
         llmRuntime: LLMRuntimeClient,
-        confidenceThreshold: Double = 0.80,
-        autoPlanningService: AutoPlanningService? = nil
+        confidenceThreshold: Double = 0.80
     ) {
         self.accountID = accountID
         self.accountEmail = accountEmail
@@ -64,7 +62,6 @@ public final class OutlookIngestionService {
         self.taskRepository = taskRepository
         self.llmRuntime = llmRuntime
         self.confidenceThreshold = confidenceThreshold
-        self.autoPlanningService = autoPlanningService
     }
 
     public func sync() async throws -> OutlookSyncSummary {
@@ -97,18 +94,38 @@ public final class OutlookIngestionService {
             (card, RulesEngine.validate(update: card, context: ExtractionValidationContext(confidenceThreshold: confidenceThreshold)))
         }
 
-        let approved = validated.compactMap { item -> UpdateCard? in
-            if case .approved = item.1 { return item.0 }
-            return nil
+        var updatesForStorage: [UpdateCard] = []
+        var extractionCandidates: [UpdateCard] = []
+        for (card, decision) in validated {
+            switch decision {
+            case .approved:
+                let triage = TaskIntentTriageEngine.evaluate(update: card)
+                switch triage.classification {
+                case .actionable:
+                    var enriched = card
+                    enriched.tags = appendUniqueTag("triage:actionable", to: enriched.tags)
+                    updatesForStorage.append(enriched)
+                    extractionCandidates.append(enriched)
+                case .maybeActionable:
+                    updatesForStorage.append(markForReview(update: card, reason: "triage_maybe_actionable"))
+                case .ignore:
+                    var enriched = card
+                    enriched.tags = appendUniqueTag("triage:ignored", to: enriched.tags)
+                    updatesForStorage.append(enriched)
+                }
+            case let .requiresConfirmation(reason):
+                updatesForStorage.append(markForReview(update: card, reason: "rules_\(sanitizeTag(reason))"))
+            case let .rejected(reason):
+                var enriched = card
+                enriched.tags = appendUniqueTag("rules:rejected:\(sanitizeTag(reason))", to: enriched.tags)
+                updatesForStorage.append(enriched)
+            }
         }
 
-        let tasks = try await llmRuntime.inferExtractTasks(from: approved)
+        let tasks = try await llmRuntime.inferExtractTasks(from: extractionCandidates)
 
-        let storedUpdates = try updateRepository.upsert(updateCards)
+        let storedUpdates = try updateRepository.upsert(updatesForStorage)
         let storedTasks = try taskRepository.upsert(tasks)
-        if let autoPlanningService {
-            _ = try await autoPlanningService.regenerate(now: Date(), trigger: "outlook_sync")
-        }
 
         if let nextCursor {
             try cursorRepository.upsert(
@@ -130,6 +147,27 @@ public final class OutlookIngestionService {
             createdOrUpdatedTasks: storedTasks,
             nextCursor: nextCursor?.receivedDateTimeISO8601
         )
+    }
+
+    private func markForReview(update: UpdateCard, reason: String) -> UpdateCard {
+        var enriched = update
+        enriched.requiresConfirmation = true
+        var tags = enriched.tags
+        tags = appendUniqueTag("review_queue", to: tags)
+        tags = appendUniqueTag("review_reason:\(sanitizeTag(reason))", to: tags)
+        enriched.tags = tags
+        return enriched
+    }
+
+    private func appendUniqueTag(_ tag: String, to tags: [String]) -> [String] {
+        if tags.contains(tag) {
+            return tags
+        }
+        return tags + [tag]
+    }
+
+    private func sanitizeTag(_ raw: String) -> String {
+        raw.lowercased().replacingOccurrences(of: " ", with: "_")
     }
 
     private func parseCursor(_ record: ProviderCursorRecord?) -> OutlookSyncCursor? {

@@ -95,8 +95,7 @@ public final class MultiAccountSyncCoordinator {
                     updateRepository: updateRepository,
                     taskRepository: taskRepository,
                     llmRuntime: llmRuntime,
-                    confidenceThreshold: confidenceThreshold,
-                    autoPlanningService: autoPlanningService
+                    confidenceThreshold: confidenceThreshold
                 )
                 do {
                     gmailSummaries.append(try await service.sync())
@@ -120,8 +119,7 @@ public final class MultiAccountSyncCoordinator {
                     updateRepository: updateRepository,
                     taskRepository: taskRepository,
                     llmRuntime: llmRuntime,
-                    confidenceThreshold: confidenceThreshold,
-                    autoPlanningService: autoPlanningService
+                    confidenceThreshold: confidenceThreshold
                 )
                 do {
                     outlookSummaries.append(try await service.sync())
@@ -136,6 +134,10 @@ public final class MultiAccountSyncCoordinator {
                     )
                 }
             }
+        }
+
+        if let autoPlanningService, (!gmailSummaries.isEmpty || !outlookSummaries.isEmpty) {
+            _ = try await autoPlanningService.regenerate(now: Date(), trigger: "sync_all_accounts")
         }
 
         return MultiAccountSyncResult(gmail: gmailSummaries, outlook: outlookSummaries, failures: failures)

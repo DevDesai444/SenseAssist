@@ -5,7 +5,7 @@ SHELL := /bin/bash
 DB_PATH ?= $(HOME)/.senseassist/senseassist.sqlite
 SQLITE3 ?= sqlite3
 
-.PHONY: help status git-summary test helper-health llm-install llm-smoke sync-all-demo sync-all-live db-summary
+.PHONY: help status git-summary test helper-health llm-install llm-smoke llm-bench sync-all-demo sync-all-live db-summary
 
 help:
 	@echo "SenseAssist commands"
@@ -14,6 +14,7 @@ help:
 	@echo "  make helper-health  Run helper health check"
 	@echo "  make llm-install    Install Phi-3.5-mini-instruct-onnx on-device model + env file"
 	@echo "  make llm-smoke      Run on-device ONNX LLM smoke check"
+	@echo "  make llm-bench      Run on-device ONNX LLM benchmark suite"
 	@echo "  make sync-all-demo  Run multi-account sync demo"
 	@echo "  make sync-all-live  Run live multi-account sync (requires OAuth tokens + local ONNX Runtime GenAI model)"
 	@echo "  make db-summary     Print key DB summary tables"
@@ -46,6 +47,11 @@ llm-install:
 llm-smoke:
 	@echo "== on-device LLM smoke check =="
 	bash Scripts/smoke_test_phi35_instruct_onnx.sh
+	@echo ""
+
+llm-bench:
+	@echo "== on-device LLM benchmark =="
+	bash Scripts/benchmark_phi35_instruct_onnx.sh
 	@echo ""
 
 sync-all-demo:

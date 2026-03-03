@@ -8,6 +8,7 @@ from __future__ import annotations
 
 import json
 import sys
+import time
 from pathlib import Path
 from typing import Any
 
@@ -80,6 +81,7 @@ def _format_prompt(tokenizer: Any, prompt: str) -> str:
 
 def main() -> None:
     request = _load_request()
+    request_started = time.perf_counter()
 
     model_path = str(request.get("model_path", "")).strip()
     prompt = str(request.get("prompt", ""))
@@ -121,16 +123,53 @@ def main() -> None:
 
         generator = og.Generator(model, params)
         generator.append_tokens(input_ids)
+        generation_started = time.perf_counter()
+        first_token_completed: float | None = None
+        generated_token_steps = 0
         while not generator.is_done():
             generator.generate_next_token()
+            generated_token_steps += 1
+            if first_token_completed is None:
+                first_token_completed = time.perf_counter()
+        generation_completed = time.perf_counter()
 
         output_ids = generator.get_sequence(0)
         generated_ids = output_ids[prompt_token_count:]
+        output_token_count = int(getattr(generated_ids, "size", len(generated_ids)))
+        decode_started = time.perf_counter()
         text = tokenizer.decode(generated_ids)
+        decode_completed = time.perf_counter()
     except Exception as exc:  # noqa: BLE001
         _fatal(f"onnxruntime_generation_failed: {exc}")
 
-    json.dump({"text": text}, sys.stdout)
+    generation_elapsed_s = max(generation_completed - generation_started, 0.0)
+    total_elapsed_s = max(decode_completed - request_started, 0.0)
+    ttft_ms = None
+    if first_token_completed is not None:
+        ttft_ms = (first_token_completed - generation_started) * 1000.0
+
+    generated_tokens = output_token_count if output_token_count >= 0 else generated_token_steps
+    tokens_per_second = (generated_tokens / generation_elapsed_s) if generation_elapsed_s > 0 else 0.0
+    e2e_tokens_per_second = (generated_tokens / total_elapsed_s) if total_elapsed_s > 0 else 0.0
+
+    json.dump(
+        {
+            "text": text,
+            "metrics": {
+                "prompt_tokens": prompt_token_count,
+                "generated_tokens": generated_tokens,
+                "total_tokens": prompt_token_count + generated_tokens,
+                "ttft_ms": ttft_ms,
+                "setup_latency_ms": max(generation_started - request_started, 0.0) * 1000.0,
+                "generation_latency_ms": generation_elapsed_s * 1000.0,
+                "decode_latency_ms": max(decode_completed - decode_started, 0.0) * 1000.0,
+                "total_latency_ms": total_elapsed_s * 1000.0,
+                "tokens_per_second": tokens_per_second,
+                "e2e_tokens_per_second": e2e_tokens_per_second,
+            },
+        },
+        sys.stdout,
+    )
 
 
 if __name__ == "__main__":
