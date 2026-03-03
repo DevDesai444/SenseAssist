@@ -90,7 +90,8 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         var lastRawOutput = ""
         var lastError: Error?
 
-        for attempt in 1...3 {
+        let maxAttempts = 2
+        for attempt in 1...maxAttempts {
             do {
                 let raw = try generate(prompt: prompt)
                 lastRawOutput = raw
@@ -100,7 +101,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
                 break
             } catch {
                 lastError = error
-                guard attempt < 3 else {
+                guard attempt < maxAttempts else {
                     throw error
                 }
                 prompt = buildExtractionRepairPrompt(
@@ -246,7 +247,8 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         var lastRawOutput = ""
         var lastError: Error?
 
-        for attempt in 1...3 {
+        let maxAttempts = 2
+        for attempt in 1...maxAttempts {
             do {
                 let raw = try generate(prompt: prompt)
                 lastRawOutput = raw
@@ -263,7 +265,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
                 )
             } catch {
                 lastError = error
-                guard attempt < 3 else {
+                guard attempt < maxAttempts else {
                     throw error
                 }
                 prompt = buildScheduleRepairPrompt(
@@ -403,7 +405,8 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
         var lastRawOutput = ""
         var lastError: Error?
 
-        for attempt in 1...3 {
+        let maxAttempts = 2
+        for attempt in 1...maxAttempts {
             do {
                 let raw = try await generate(prompt: prompt)
                 lastRawOutput = raw
@@ -413,7 +416,7 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
                 break
             } catch {
                 lastError = error
-                guard attempt < 3 else {
+                guard attempt < maxAttempts else {
                     throw error
                 }
                 prompt = buildExtractionRepairPrompt(
@@ -559,7 +562,8 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
         var lastRawOutput = ""
         var lastError: Error?
 
-        for attempt in 1...3 {
+        let maxAttempts = 2
+        for attempt in 1...maxAttempts {
             do {
                 let raw = try await generate(prompt: prompt)
                 lastRawOutput = raw
@@ -576,7 +580,7 @@ public struct OllamaLLMRuntime: LLMRuntimeClient {
                 )
             } catch {
                 lastError = error
-                guard attempt < 3 else {
+                guard attempt < maxAttempts else {
                     throw error
                 }
                 prompt = buildScheduleRepairPrompt(
