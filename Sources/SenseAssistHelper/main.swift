@@ -635,6 +635,10 @@ struct SenseAssistHelperMain {
 
         let pythonPath = environment["SENSEASSIST_ONNX_PYTHON"] ?? "/usr/bin/python3"
         let maxNewTokens = Int(environment["SENSEASSIST_ONNX_MAX_NEW_TOKENS"] ?? "") ?? 512
+        let extractionMaxNewTokens = Int(environment["SENSEASSIST_ONNX_MAX_NEW_TOKENS_EXTRACT"] ?? "")
+        let dueDateRepairMaxNewTokens = Int(environment["SENSEASSIST_ONNX_MAX_NEW_TOKENS_DUE_REPAIR"] ?? "")
+        let slackEditMaxNewTokens = Int(environment["SENSEASSIST_ONNX_MAX_NEW_TOKENS_EDIT"] ?? "")
+        let scheduleMaxNewTokens = Int(environment["SENSEASSIST_ONNX_MAX_NEW_TOKENS_SCHEDULE"] ?? "")
         let temperature = Double(environment["SENSEASSIST_ONNX_TEMPERATURE"] ?? "") ?? 0.2
         let topP = Double(environment["SENSEASSIST_ONNX_TOP_P"] ?? "") ?? 0.95
         let provider = environment["SENSEASSIST_ONNX_PROVIDER"]
@@ -644,6 +648,10 @@ struct SenseAssistHelperMain {
             runnerScriptPath: runnerPath,
             pythonExecutable: pythonPath,
             maxNewTokens: maxNewTokens,
+            extractionMaxNewTokens: extractionMaxNewTokens,
+            dueDateRepairMaxNewTokens: dueDateRepairMaxNewTokens,
+            slackEditMaxNewTokens: slackEditMaxNewTokens,
+            scheduleMaxNewTokens: scheduleMaxNewTokens,
             temperature: temperature,
             topP: topP,
             provider: provider,

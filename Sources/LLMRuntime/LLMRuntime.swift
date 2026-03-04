@@ -54,16 +54,25 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
     private let runnerScriptPath: String
     private let pythonExecutable: String
     private let maxNewTokens: Int
+    private let extractionMaxNewTokens: Int
+    private let dueDateRepairMaxNewTokens: Int
+    private let slackEditMaxNewTokens: Int
+    private let scheduleMaxNewTokens: Int
     private let temperature: Double
     private let topP: Double
     private let provider: String?
     private let plannerInputFilePath: String?
+    private let daemonClient: ONNXRunnerDaemonClient
 
     public init(
         modelPath: String,
         runnerScriptPath: String,
         pythonExecutable: String = "/usr/bin/python3",
         maxNewTokens: Int = 512,
+        extractionMaxNewTokens: Int? = nil,
+        dueDateRepairMaxNewTokens: Int? = nil,
+        slackEditMaxNewTokens: Int? = nil,
+        scheduleMaxNewTokens: Int? = nil,
         temperature: Double = 0.2,
         topP: Double = 0.95,
         provider: String? = nil,
@@ -72,11 +81,20 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         self.modelPath = modelPath
         self.runnerScriptPath = runnerScriptPath
         self.pythonExecutable = pythonExecutable
-        self.maxNewTokens = max(64, maxNewTokens)
+        let normalizedMaxNewTokens = max(64, maxNewTokens)
+        self.maxNewTokens = normalizedMaxNewTokens
+        self.extractionMaxNewTokens = min(normalizedMaxNewTokens, max(64, extractionMaxNewTokens ?? 256))
+        self.dueDateRepairMaxNewTokens = min(normalizedMaxNewTokens, max(64, dueDateRepairMaxNewTokens ?? 128))
+        self.slackEditMaxNewTokens = min(normalizedMaxNewTokens, max(64, slackEditMaxNewTokens ?? 160))
+        self.scheduleMaxNewTokens = min(normalizedMaxNewTokens, max(64, scheduleMaxNewTokens ?? 384))
         self.temperature = max(0.0, temperature)
         self.topP = min(max(topP, 0.0), 1.0)
         self.provider = provider
         self.plannerInputFilePath = plannerInputFilePath
+        self.daemonClient = ONNXRunnerDaemonClient(
+            pythonExecutable: pythonExecutable,
+            runnerScriptPath: runnerScriptPath
+        )
     }
 
     public func inferExtractTasks(from updates: [UpdateCard]) async throws -> [TaskItem] {
@@ -84,6 +102,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
             return []
         }
 
+        let tokenBudget = extractionTokenBudget(updateCount: updates.count)
         let basePrompt = buildTaskExtractionPrompt(updates: updates)
         var prompt = basePrompt
         var decoded: [ExtractedTaskPayload] = []
@@ -93,7 +112,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         let maxAttempts = 2
         for attempt in 1...maxAttempts {
             do {
-                let raw = try generate(prompt: prompt)
+                let raw = try await generate(prompt: prompt, maxNewTokens: tokenBudget)
                 lastRawOutput = raw
                 let json = try extractJSONArray(from: raw)
                 decoded = try JSONDecoder().decode([ExtractedTaskPayload].self, from: Data(json.utf8))
@@ -136,7 +155,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
             $0.dueAtLocal == nil && requiresDueDate(category: $0.payload.category)
         }
         if !unresolved.isEmpty {
-            let repaired = try repairDueDates(for: unresolved.map(\.sourceUpdate))
+            let repaired = try await repairDueDates(for: unresolved.map(\.sourceUpdate))
             for index in mapped.indices {
                 guard mapped[index].dueAtLocal == nil else { continue }
                 let messageID = mapped[index].sourceUpdate.providerIDs.messageID
@@ -191,7 +210,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         \(messageText)
         """
 
-        let raw = try generate(prompt: prompt)
+        let raw = try await generate(prompt: prompt, maxNewTokens: slackEditMaxNewTokens)
         let json = try extractJSONObject(from: raw)
         let payload = try JSONDecoder().decode(SlackEditPayload.self, from: Data(json.utf8))
 
@@ -246,11 +265,12 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         var prompt = basePrompt
         var lastRawOutput = ""
         var lastError: Error?
+        let tokenBudget = scheduleTokenBudget(taskCount: activeTasks.count)
 
         let maxAttempts = 2
         for attempt in 1...maxAttempts {
             do {
-                let raw = try generate(prompt: prompt)
+                let raw = try await generate(prompt: prompt, maxNewTokens: tokenBudget)
                 lastRawOutput = raw
                 let json = try extractJSONObject(from: raw)
                 let payload = try JSONDecoder().decode(SchedulePlanPayload.self, from: Data(json.utf8))
@@ -279,11 +299,28 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         throw lastError ?? LLMRuntimeError.invalidJSON
     }
 
-    private func generate(prompt: String) throws -> String {
+    private func generate(prompt: String, maxNewTokens: Int) async throws -> String {
         guard FileManager.default.fileExists(atPath: runnerScriptPath) else {
             throw LLMRuntimeError.runnerNotFound(path: runnerScriptPath)
         }
 
+        let request = ONNXRunnerRequest(
+            modelPath: modelPath,
+            prompt: prompt,
+            maxNewTokens: min(self.maxNewTokens, max(64, maxNewTokens)),
+            temperature: temperature,
+            topP: topP,
+            provider: provider
+        )
+
+        do {
+            return try await daemonClient.generate(request: request)
+        } catch is ONNXDaemonTransportError {
+            return try runOneShot(request: request)
+        }
+    }
+
+    private func runOneShot(request: ONNXRunnerRequest) throws -> String {
         let process = Process()
         process.executableURL = URL(fileURLWithPath: pythonExecutable)
         process.arguments = [runnerScriptPath]
@@ -294,15 +331,6 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         process.standardInput = stdinPipe
         process.standardOutput = stdoutPipe
         process.standardError = stderrPipe
-
-        let request = ONNXRunnerRequest(
-            modelPath: modelPath,
-            prompt: prompt,
-            maxNewTokens: maxNewTokens,
-            temperature: temperature,
-            topP: topP,
-            provider: provider
-        )
 
         do {
             try process.run()
@@ -332,8 +360,24 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         guard let response = try? JSONDecoder().decode(ONNXRunnerResponse.self, from: outputData) else {
             throw LLMRuntimeError.runnerInvalidOutput
         }
+        if let error = response.error {
+            throw LLMRuntimeError.runnerExecutionFailed(code: process.terminationStatus, stderr: error)
+        }
+        guard let text = response.text, !text.isEmpty else {
+            throw LLMRuntimeError.runnerInvalidOutput
+        }
 
-        return response.text
+        return text
+    }
+
+    private func extractionTokenBudget(updateCount: Int) -> Int {
+        let scaled = max(128, updateCount * 64)
+        return min(extractionMaxNewTokens, max(64, scaled))
+    }
+
+    private func scheduleTokenBudget(taskCount: Int) -> Int {
+        let scaled = max(192, taskCount * 56)
+        return min(scheduleMaxNewTokens, max(64, scaled))
     }
 
     private func jsonString(_ value: Any) -> String {
@@ -364,13 +408,13 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         parseLLMDueDate(value)
     }
 
-    private func repairDueDates(for updates: [UpdateCard]) throws -> [String: String] {
+    private func repairDueDates(for updates: [UpdateCard]) async throws -> [String: String] {
         guard !updates.isEmpty else {
             return [:]
         }
 
         let prompt = buildDueDateRepairPrompt(updates: updates)
-        let raw = try generate(prompt: prompt)
+        let raw = try await generate(prompt: prompt, maxNewTokens: dueDateRepairMaxNewTokens)
         let json = try extractJSONObject(from: raw)
         return try decodeDueDateRepairMap(json: json)
     }
@@ -1602,7 +1646,149 @@ private struct ONNXRunnerRequest: Encodable {
 }
 
 private struct ONNXRunnerResponse: Decodable {
-    let text: String
+    let text: String?
+    let error: String?
+}
+
+private struct ONNXDaemonTransportError: Error {
+    let message: String
+}
+
+private actor ONNXRunnerDaemonClient {
+    private let pythonExecutable: String
+    private let runnerScriptPath: String
+    private var process: Process?
+    private var stdinHandle: FileHandle?
+    private var stdoutHandle: FileHandle?
+    private var stdoutBuffer = Data()
+
+    init(pythonExecutable: String, runnerScriptPath: String) {
+        self.pythonExecutable = pythonExecutable
+        self.runnerScriptPath = runnerScriptPath
+    }
+
+    func generate(request: ONNXRunnerRequest) throws -> String {
+        do {
+            try ensureRunningProcess()
+            try writeRequest(request)
+            let rawResponse = try readResponseData()
+            let response = try JSONDecoder().decode(ONNXRunnerResponse.self, from: rawResponse)
+
+            if let error = response.error {
+                throw LLMRuntimeError.runnerExecutionFailed(code: -1, stderr: error)
+            }
+            guard let text = response.text, !text.isEmpty else {
+                throw ONNXDaemonTransportError(message: "Daemon response did not contain text output.")
+            }
+
+            return text
+        } catch let error as LLMRuntimeError {
+            throw error
+        } catch {
+            reset()
+            if let transport = error as? ONNXDaemonTransportError {
+                throw transport
+            }
+            throw ONNXDaemonTransportError(message: error.localizedDescription)
+        }
+    }
+
+    private func ensureRunningProcess() throws {
+        if let process, process.isRunning {
+            return
+        }
+
+        reset()
+
+        let process = Process()
+        process.executableURL = URL(fileURLWithPath: pythonExecutable)
+        process.arguments = [runnerScriptPath, "--daemon"]
+
+        let stdinPipe = Pipe()
+        let stdoutPipe = Pipe()
+        process.standardInput = stdinPipe
+        process.standardOutput = stdoutPipe
+        process.standardError = FileHandle.nullDevice
+
+        do {
+            try process.run()
+        } catch {
+            throw ONNXDaemonTransportError(message: "Failed to launch daemon: \(error.localizedDescription)")
+        }
+
+        self.process = process
+        self.stdinHandle = stdinPipe.fileHandleForWriting
+        self.stdoutHandle = stdoutPipe.fileHandleForReading
+        self.stdoutBuffer.removeAll(keepingCapacity: true)
+    }
+
+    private func writeRequest(_ request: ONNXRunnerRequest) throws {
+        guard let stdinHandle else {
+            throw ONNXDaemonTransportError(message: "Daemon stdin is not available.")
+        }
+
+        do {
+            var payload = try JSONEncoder().encode(request)
+            payload.append(0x0A)
+            try stdinHandle.write(contentsOf: payload)
+        } catch {
+            throw ONNXDaemonTransportError(message: "Failed to write daemon request: \(error.localizedDescription)")
+        }
+    }
+
+    private func readResponseData() throws -> Data {
+        guard let stdoutHandle else {
+            throw ONNXDaemonTransportError(message: "Daemon stdout is not available.")
+        }
+
+        while true {
+            if let newlineIndex = stdoutBuffer.firstIndex(of: 0x0A) {
+                let line = stdoutBuffer.prefix(upTo: newlineIndex)
+                stdoutBuffer.removeSubrange(...newlineIndex)
+                if line.isEmpty {
+                    continue
+                }
+                return Data(line)
+            }
+
+            let chunk: Data
+            do {
+                chunk = try stdoutHandle.read(upToCount: 4096) ?? Data()
+            } catch {
+                throw ONNXDaemonTransportError(message: "Failed to read daemon output: \(error.localizedDescription)")
+            }
+
+            if chunk.isEmpty {
+                if !stdoutBuffer.isEmpty {
+                    defer { stdoutBuffer.removeAll(keepingCapacity: true) }
+                    return stdoutBuffer
+                }
+                if let process {
+                    throw ONNXDaemonTransportError(
+                        message: "Daemon exited before returning output (status \(process.terminationStatus))."
+                    )
+                }
+                throw ONNXDaemonTransportError(message: "Daemon closed output pipe.")
+            }
+
+            stdoutBuffer.append(chunk)
+        }
+    }
+
+    private func reset() {
+        stdinHandle?.closeFile()
+        stdoutHandle?.closeFile()
+
+        if let process, process.isRunning {
+            process.terminate()
+            process.waitUntilExit()
+        }
+
+        process = nil
+        stdinHandle = nil
+        stdoutHandle = nil
+        stdoutBuffer.removeAll(keepingCapacity: true)
+    }
 }
 
 private struct ExtractedTaskPayload: Decodable {
