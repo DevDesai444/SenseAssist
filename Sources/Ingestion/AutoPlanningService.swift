@@ -127,6 +127,7 @@ public final class AutoPlanningService {
     private let managedCalendarName: String
     private let constraints: PlannerConstraints
     private let calendar: Calendar
+    private let logger: Logging?
 
     public init(
         taskRepository: TaskRepository,
@@ -140,7 +141,8 @@ public final class AutoPlanningService {
         plannerInputFilePath: String? = nil,
         managedCalendarName: String = "SenseAssist",
         constraints: PlannerConstraints,
-        calendar: Calendar = .current
+        calendar: Calendar = .current,
+        logger: Logging? = nil
     ) {
         self.taskRepository = taskRepository
         self.planRevisionRepository = planRevisionRepository
@@ -154,6 +156,7 @@ public final class AutoPlanningService {
         self.managedCalendarName = managedCalendarName
         self.constraints = constraints
         self.calendar = calendar
+        self.logger = logger
     }
 
     public func regenerate(now: Date = Date(), trigger: String) async throws -> AutoPlanningApplySummary {
@@ -230,16 +233,24 @@ public final class AutoPlanningService {
                 payloadJSON = "{}"
             }
 
-            try? operationRepository.insert(
-                StoredOperationRecord(
-                    expectedPlanRevision: nil,
-                    appliedRevision: revisionID,
-                    intent: EditIntent.regeneratePlan.rawValue,
-                    status: "applied",
-                    payloadJSON: payloadJSON,
-                    resultJSON: nil
+            do {
+                try operationRepository.insert(
+                    StoredOperationRecord(
+                        expectedPlanRevision: nil,
+                        appliedRevision: revisionID,
+                        intent: EditIntent.regeneratePlan.rawValue,
+                        status: "applied",
+                        payloadJSON: payloadJSON,
+                        resultJSON: nil
+                    )
                 )
-            )
+            } catch {
+                logger?.log(
+                    .warning,
+                    "auto_planning_operation_record_failed revision=\(revisionID): \(error.localizedDescription)",
+                    category: "planner"
+                )
+            }
         }
 
         return AutoPlanningApplySummary(

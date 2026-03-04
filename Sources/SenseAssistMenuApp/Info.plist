@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<plist version="1.0">
+<dict>
+    <key>CFBundleIdentifier</key>
+    <string>com.senseassist.menu</string>
+    <key>CFBundleName</key>
+    <string>SenseAssist</string>
+    <key>CFBundleVersion</key>
+    <string>1</string>
+    <key>CFBundleShortVersionString</key>
+    <string>1.0</string>
+    <key>NSCalendarsUsageDescription</key>
+    <string>SenseAssist needs calendar access to write your planned work blocks to a dedicated managed calendar.</string>
+    <key>NSCalendarsFullAccessUsageDescription</key>
+    <string>SenseAssist needs full calendar access to create and manage your planned work blocks.</string>
+</dict>
+</plist>

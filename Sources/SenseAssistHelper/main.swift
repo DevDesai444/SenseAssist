@@ -42,10 +42,34 @@ struct SenseAssistHelperMain {
         let logger = ConsoleLogger(minimumLevel: .info)
 
         do {
-            let environment = ProcessInfo.processInfo.environment
+            let processEnvironment = ProcessInfo.processInfo.environment
+            let environment = runtimeEnvironment(from: processEnvironment, logger: logger)
             let arguments = ProcessInfo.processInfo.arguments
             let home = environment["HOME"] ?? FileManager.default.currentDirectoryPath
-            let config = SenseAssistConfiguration.default(homeDirectory: home)
+            let currentDirectory = FileManager.default.currentDirectoryPath
+            var config = SenseAssistConfiguration.default(homeDirectory: home)
+
+            if let explicitDBPath = (
+                environment["SENSEASSIST_DATABASE_PATH"] ??
+                    environment["SENSEASSIST_DB_PATH"]
+            )?.trimmingCharacters(in: .whitespacesAndNewlines),
+                !explicitDBPath.isEmpty {
+                config.databasePath = (explicitDBPath as NSString).expandingTildeInPath
+            }
+
+            let resolvedDatabasePath = RuntimePathResolver.resolveWritableDatabasePath(
+                preferredPath: config.databasePath,
+                fallbackBaseDirectory: currentDirectory
+            )
+            if resolvedDatabasePath != config.databasePath {
+                logger.log(
+                    .warning,
+                    "database_path_fallback preferred=\(config.databasePath) fallback=\(resolvedDatabasePath)",
+                    category: "storage"
+                )
+                config.databasePath = resolvedDatabasePath
+            }
+
             let demoModeEnabled = environment["SENSEASSIST_ENABLE_DEMO_COMMANDS"] == "1" || arguments.contains("--allow-demo")
 
             let bootstrap = try StorageBootstrap.run(config: config, logger: logger)
@@ -103,7 +127,7 @@ struct SenseAssistHelperMain {
             }
 
             if arguments.contains("--sync-live-once") {
-                let report = try await runMultiAccountSyncLive(config: config, logger: logger)
+                let report = try await runMultiAccountSyncLive(config: config, logger: logger, environment: environment)
                 print(report.report)
                 Foundation.exit(0)
             }
@@ -142,7 +166,7 @@ struct SenseAssistHelperMain {
             }
 
             _ = connectedSlackClient
-            try await runBackgroundSyncLoop(config: config, logger: logger)
+            try await runBackgroundSyncLoop(config: config, logger: logger, environment: environment)
         } catch {
             fputs("Helper failed: \(error.localizedDescription)\n", stderr)
             Foundation.exit(1)
@@ -160,6 +184,113 @@ struct SenseAssistHelperMain {
         }
 
         return next.joined(separator: " ")
+    }
+
+    private static let localEnvironmentFiles = [".env.onnx.local", ".env.oauth.local"]
+
+    private static func runtimeEnvironment(from processEnvironment: [String: String], logger: Logging?) -> [String: String] {
+        let candidates = candidateEnvironmentFiles(from: processEnvironment)
+        guard !candidates.isEmpty else {
+            return processEnvironment
+        }
+
+        var merged = processEnvironment
+        for candidate in candidates {
+            let path = (candidate as NSString).expandingTildeInPath
+            guard FileManager.default.fileExists(atPath: path) else {
+                continue
+            }
+
+            do {
+                let parsed = try parseEnvironmentFile(path: path)
+                var importedCount = 0
+
+                for (key, value) in parsed {
+                    if merged[key]?.isEmpty ?? true {
+                        merged[key] = value
+                        importedCount += 1
+                    }
+                }
+
+                if importedCount > 0 {
+                    logger?.log(
+                        .info,
+                        "loaded_env_file path=\(path) imported_keys=\(importedCount)",
+                        category: "helper"
+                    )
+                }
+            } catch {
+                logger?.log(
+                    .warning,
+                    "env_file_parse_failed path=\(path): \(error.localizedDescription)",
+                    category: "helper"
+                )
+            }
+        }
+
+        return merged
+    }
+
+    private static func candidateEnvironmentFiles(from processEnvironment: [String: String]) -> [String] {
+        var candidates: [String] = []
+
+        if let explicit = processEnvironment["SENSEASSIST_ENV_FILE"]?.trimmingCharacters(in: .whitespacesAndNewlines),
+           !explicit.isEmpty {
+            candidates.append(explicit)
+        }
+
+        let cwd = FileManager.default.currentDirectoryPath
+        for file in localEnvironmentFiles {
+            candidates.append((cwd as NSString).appendingPathComponent(file))
+        }
+
+        var deduplicated: [String] = []
+        var seen = Set<String>()
+        for candidate in candidates {
+            if seen.insert(candidate).inserted {
+                deduplicated.append(candidate)
+            }
+        }
+        return deduplicated
+    }
+
+    private static func parseEnvironmentFile(path: String) throws -> [String: String] {
+        let content = try String(contentsOfFile: path, encoding: .utf8)
+        let lines = content.components(separatedBy: .newlines)
+        var parsed: [String: String] = [:]
+
+        for raw in lines {
+            var line = raw.trimmingCharacters(in: .whitespacesAndNewlines)
+            if line.isEmpty || line.hasPrefix("#") {
+                continue
+            }
+
+            if line.hasPrefix("export ") {
+                line = String(line.dropFirst("export ".count)).trimmingCharacters(in: .whitespacesAndNewlines)
+            }
+
+            guard let separator = line.firstIndex(of: "=") else {
+                continue
+            }
+
+            let key = String(line[..<separator]).trimmingCharacters(in: .whitespacesAndNewlines)
+            var value = String(line[line.index(after: separator)...]).trimmingCharacters(in: .whitespacesAndNewlines)
+            guard !key.isEmpty else {
+                continue
+            }
+
+            if (value.hasPrefix("\"") && value.hasSuffix("\"")) || (value.hasPrefix("'") && value.hasSuffix("'")) {
+                value = String(value.dropFirst().dropLast())
+            }
+
+            if value.hasPrefix("~") {
+                value = (value as NSString).expandingTildeInPath
+            }
+
+            parsed[key] = value
+        }
+
+        return parsed
     }
 
     private static func runGmailSyncDemo(config: SenseAssistConfiguration, logger: Logging) async throws -> GmailSyncSummary {
@@ -395,7 +526,11 @@ struct SenseAssistHelperMain {
         return lines.joined(separator: "\n")
     }
 
-    private static func runBackgroundSyncLoop(config: SenseAssistConfiguration, logger: Logging) async throws {
+    private static func runBackgroundSyncLoop(
+        config: SenseAssistConfiguration,
+        logger: Logging,
+        environment: [String: String]
+    ) async throws {
         var syncState: SyncState = .normal
         var retryCount = 0
 
@@ -406,7 +541,7 @@ struct SenseAssistHelperMain {
             try await Task.sleep(for: .seconds(sleepSeconds))
 
             do {
-                let report = try await runMultiAccountSyncLive(config: config, logger: logger)
+                let report = try await runMultiAccountSyncLive(config: config, logger: logger, environment: environment)
                 logger.log(.info, report.report, category: "sync")
                 retryCount = 0
                 syncState = report.totalFetched > 0 ? .active : .idle
@@ -423,11 +558,14 @@ struct SenseAssistHelperMain {
         let totalFetched: Int
     }
 
-    private static func runMultiAccountSyncLive(config: SenseAssistConfiguration, logger: Logging) async throws -> LiveSyncExecutionResult {
+    private static func runMultiAccountSyncLive(
+        config: SenseAssistConfiguration,
+        logger: Logging,
+        environment: [String: String]
+    ) async throws -> LiveSyncExecutionResult {
         let store = SQLiteStore(databasePath: config.databasePath, logger: logger)
         try store.initialize()
         defer { store.close() }
-        let environment = ProcessInfo.processInfo.environment
         let schedulerMode = schedulerExecutionMode(from: environment["SENSEASSIST_LLM_SCHEDULER_MODE"])
         let routineTaskDefinitions = defaultDailyRoutineTasks(from: environment)
         let schedulerMinimumTaskConfidence = schedulerMinimumTaskConfidence(from: environment, fallback: config.confidenceThreshold)
@@ -456,7 +594,7 @@ struct SenseAssistHelperMain {
                     EnvironmentCredentialStore(environment: environment)
                 ]
         )
-        let llmRuntime = try configuredLLMRuntime(plannerInputFilePath: plannerInputFilePath)
+        let llmRuntime = try configuredLLMRuntime(plannerInputFilePath: plannerInputFilePath, environment: environment)
 
         var gmailTokens: [String: String] = [:]
         var outlookTokens: [String: String] = [:]
@@ -470,7 +608,8 @@ struct SenseAssistHelperMain {
                     provider: .gmail,
                     accountID: account.accountID,
                     email: account.email,
-                    environment: environment
+                    environment: environment,
+                    logger: logger
                 ) {
                     gmailTokens[account.accountID] = credential.accessToken
                 } else {
@@ -482,7 +621,8 @@ struct SenseAssistHelperMain {
                     provider: .outlook,
                     accountID: account.accountID,
                     email: account.email,
-                    environment: environment
+                    environment: environment,
+                    logger: logger
                 ) {
                     outlookTokens[account.accountID] = credential.accessToken
                 } else {
@@ -511,7 +651,8 @@ struct SenseAssistHelperMain {
                 minimumTaskSourceConfidenceForScheduling: schedulerMinimumTaskConfidence,
                 plannerInputFilePath: plannerInputFilePath,
                 managedCalendarName: "SenseAssist",
-                constraints: config.constraints
+                constraints: config.constraints,
+                logger: logger
             )
         default:
             autoPlanningService = nil
@@ -621,9 +762,10 @@ struct SenseAssistHelperMain {
         return dbURL.deletingLastPathComponent().appendingPathComponent("planner_input.json").path
     }
 
-    private static func configuredLLMRuntime(plannerInputFilePath: String?) throws -> LLMRuntimeClient {
-        let environment = ProcessInfo.processInfo.environment
-
+    private static func configuredLLMRuntime(
+        plannerInputFilePath: String?,
+        environment: [String: String]
+    ) throws -> LLMRuntimeClient {
         guard let onnxModelPath = environment["SENSEASSIST_ONNX_MODEL_PATH"], !onnxModelPath.isEmpty else {
             throw LiveSyncError.onDeviceLLMNotConfigured
         }
@@ -642,6 +784,19 @@ struct SenseAssistHelperMain {
         let temperature = Double(environment["SENSEASSIST_ONNX_TEMPERATURE"] ?? "") ?? 0.2
         let topP = Double(environment["SENSEASSIST_ONNX_TOP_P"] ?? "") ?? 0.95
         let provider = environment["SENSEASSIST_ONNX_PROVIDER"]
+        let speculativeDecodingEnabled = parseBooleanEnv(
+            environment["SENSEASSIST_ONNX_SPECULATIVE_DECODING"],
+            defaultValue: true
+        )
+        let speculativeFirstPassRatio = Double(environment["SENSEASSIST_ONNX_SPECULATIVE_FIRST_PASS_RATIO"] ?? "") ?? 0.55
+        let powerAwareThrottlingEnabled = parseBooleanEnv(
+            environment["SENSEASSIST_ONNX_POWER_AWARE_THROTTLING"],
+            defaultValue: true
+        )
+        let lowPowerModeTokenScale = Double(environment["SENSEASSIST_ONNX_LOW_POWER_TOKEN_SCALE"] ?? "") ?? 0.65
+        let lowPowerModeMinIntervalMilliseconds = Int(environment["SENSEASSIST_ONNX_LOW_POWER_MIN_INTERVAL_MS"] ?? "") ?? 80
+        let daemonBatchWindowMilliseconds = Int(environment["SENSEASSIST_ONNX_DAEMON_BATCH_WINDOW_MS"] ?? "") ?? 8
+        let daemonMaxBatchSize = Int(environment["SENSEASSIST_ONNX_DAEMON_MAX_BATCH_SIZE"] ?? "") ?? 4
 
         return ONNXGenAILLMRuntime(
             modelPath: onnxModelPath,
@@ -655,8 +810,32 @@ struct SenseAssistHelperMain {
             temperature: temperature,
             topP: topP,
             provider: provider,
-            plannerInputFilePath: plannerInputFilePath
+            plannerInputFilePath: plannerInputFilePath,
+            speculativeDecodingEnabled: speculativeDecodingEnabled,
+            speculativeFirstPassRatio: speculativeFirstPassRatio,
+            powerAwareThrottlingEnabled: powerAwareThrottlingEnabled,
+            lowPowerModeTokenScale: lowPowerModeTokenScale,
+            lowPowerModeMinIntervalMilliseconds: lowPowerModeMinIntervalMilliseconds,
+            daemonBatchWindowMilliseconds: daemonBatchWindowMilliseconds,
+            daemonMaxBatchSize: daemonMaxBatchSize
         )
+    }
+
+    private static func parseBooleanEnv(_ rawValue: String?, defaultValue: Bool) -> Bool {
+        guard let normalized = rawValue?.trimmingCharacters(in: .whitespacesAndNewlines).lowercased(),
+              !normalized.isEmpty
+        else {
+            return defaultValue
+        }
+
+        switch normalized {
+        case "1", "true", "yes", "on":
+            return true
+        case "0", "false", "no", "off":
+            return false
+        default:
+            return defaultValue
+        }
     }
 
     private static func loadOrRefreshCredential(
@@ -664,7 +843,8 @@ struct SenseAssistHelperMain {
         provider: CredentialProvider,
         accountID: String,
         email: String,
-        environment: [String: String]
+        environment: [String: String],
+        logger: Logging? = nil
     ) async throws -> OAuthCredential? {
         if let existing = try loadCredentialCandidate(
             store: store,
@@ -684,7 +864,15 @@ struct SenseAssistHelperMain {
                     refreshToken: refreshed.refreshToken ?? refreshToken,
                     expiresAtUTC: refreshed.expiresAtUTC
                 )
-                try? store.save(credential, provider: provider, accountID: accountID)
+                do {
+                    try store.save(credential, provider: provider, accountID: accountID)
+                } catch {
+                    logger?.log(
+                        .warning,
+                        "credential_cache_save_failed provider=\(provider.rawValue) account=\(accountID): \(error.localizedDescription)",
+                        category: "auth"
+                    )
+                }
                 return credential
             }
 
@@ -709,7 +897,15 @@ struct SenseAssistHelperMain {
                 refreshToken: refreshed.refreshToken ?? refreshToken,
                 expiresAtUTC: refreshed.expiresAtUTC
             )
-            try? store.save(credential, provider: provider, accountID: accountID)
+            do {
+                try store.save(credential, provider: provider, accountID: accountID)
+            } catch {
+                logger?.log(
+                    .warning,
+                    "credential_cache_save_failed provider=\(provider.rawValue) account=\(accountID): \(error.localizedDescription)",
+                    category: "auth"
+                )
+            }
             return credential
         }
 
@@ -887,7 +1083,7 @@ private enum LiveSyncError: Error, LocalizedError {
         case .demoModeDisabled:
             return "Demo commands are disabled. Set SENSEASSIST_ENABLE_DEMO_COMMANDS=1 or pass --allow-demo."
         case .onDeviceLLMNotConfigured:
-            return "On-device LLM is required. Set SENSEASSIST_ONNX_MODEL_PATH to a local ONNX Runtime GenAI model path."
+            return "On-device LLM is required. Set SENSEASSIST_ONNX_MODEL_PATH or add it to .env.onnx.local."
         case let .onDeviceLLMRunnerMissing(path):
             return "ONNX runner script not found at \(path). Set SENSEASSIST_ONNX_RUNNER to a valid local runner script."
         }

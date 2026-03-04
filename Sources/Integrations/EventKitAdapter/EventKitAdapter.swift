@@ -148,6 +148,33 @@ public actor EventKitService: CalendarStore {
         }
     }
 
+    public func requestCalendarAccessIfNeeded() async -> EventKitPermissionState {
+        let current = currentPermissionState()
+        guard current == .notDetermined else {
+            return current
+        }
+
+        if #available(macOS 14.0, *) {
+            do {
+                _ = try await store.requestFullAccessToEvents()
+            } catch {
+                // If full access request fails for any reason, keep current state and let caller handle remediation.
+            }
+        } else {
+            _ = try? await withCheckedThrowingContinuation { (continuation: CheckedContinuation<Void, Error>) in
+                store.requestAccess(to: .event) { _, error in
+                    if let error {
+                        continuation.resume(throwing: error)
+                    } else {
+                        continuation.resume(returning: ())
+                    }
+                }
+            }
+        }
+
+        return currentPermissionState()
+    }
+
     public func ensureManagedCalendar(named name: String) async throws {
         activeManagedCalendarName = name
         _ = try resolveManagedCalendar(named: name, createIfMissing: true)
@@ -321,6 +348,10 @@ public actor EventKitService: CalendarStore {
     }
 
     public func currentPermissionState() -> EventKitPermissionState {
+        .denied
+    }
+
+    public func requestCalendarAccessIfNeeded() async -> EventKitPermissionState {
         .denied
     }
 

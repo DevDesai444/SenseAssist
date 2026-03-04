@@ -1,4 +1,5 @@
 import CoreContracts
+import CryptoKit
 import Foundation
 
 public enum LLMRuntimeError: Error, LocalizedError {
@@ -62,6 +63,12 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
     private let topP: Double
     private let provider: String?
     private let plannerInputFilePath: String?
+    private let speculativeDecodingEnabled: Bool
+    private let speculativeFirstPassRatio: Double
+    private let powerAwareThrottlingEnabled: Bool
+    private let lowPowerModeTokenScale: Double
+    private let lowPowerModeMinIntervalMilliseconds: Int
+    private let throttleController = ONNXRequestThrottleController()
     private let daemonClient: ONNXRunnerDaemonClient
 
     public init(
@@ -76,7 +83,14 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         temperature: Double = 0.2,
         topP: Double = 0.95,
         provider: String? = nil,
-        plannerInputFilePath: String? = nil
+        plannerInputFilePath: String? = nil,
+        speculativeDecodingEnabled: Bool = true,
+        speculativeFirstPassRatio: Double = 0.55,
+        powerAwareThrottlingEnabled: Bool = true,
+        lowPowerModeTokenScale: Double = 0.65,
+        lowPowerModeMinIntervalMilliseconds: Int = 80,
+        daemonBatchWindowMilliseconds: Int = 8,
+        daemonMaxBatchSize: Int = 4
     ) {
         self.modelPath = modelPath
         self.runnerScriptPath = runnerScriptPath
@@ -91,9 +105,16 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         self.topP = min(max(topP, 0.0), 1.0)
         self.provider = provider
         self.plannerInputFilePath = plannerInputFilePath
+        self.speculativeDecodingEnabled = speculativeDecodingEnabled
+        self.speculativeFirstPassRatio = min(max(speculativeFirstPassRatio, 0.10), 0.95)
+        self.powerAwareThrottlingEnabled = powerAwareThrottlingEnabled
+        self.lowPowerModeTokenScale = min(max(lowPowerModeTokenScale, 0.20), 1.0)
+        self.lowPowerModeMinIntervalMilliseconds = max(0, lowPowerModeMinIntervalMilliseconds)
         self.daemonClient = ONNXRunnerDaemonClient(
             pythonExecutable: pythonExecutable,
-            runnerScriptPath: runnerScriptPath
+            runnerScriptPath: runnerScriptPath,
+            batchWindowMilliseconds: max(0, daemonBatchWindowMilliseconds),
+            maxBatchSize: max(1, daemonMaxBatchSize)
         )
     }
 
@@ -112,7 +133,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         let maxAttempts = 2
         for attempt in 1...maxAttempts {
             do {
-                let raw = try await generate(prompt: prompt, maxNewTokens: tokenBudget)
+                let raw = try await generateWithSpeculativeDecoding(prompt: prompt, maxNewTokens: tokenBudget)
                 lastRawOutput = raw
                 let json = try extractJSONArray(from: raw)
                 decoded = try JSONDecoder().decode([ExtractedTaskPayload].self, from: Data(json.utf8))
@@ -210,7 +231,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         \(messageText)
         """
 
-        let raw = try await generate(prompt: prompt, maxNewTokens: slackEditMaxNewTokens)
+        let raw = try await generateWithSpeculativeDecoding(prompt: prompt, maxNewTokens: slackEditMaxNewTokens)
         let json = try extractJSONObject(from: raw)
         let payload = try JSONDecoder().decode(SlackEditPayload.self, from: Data(json.utf8))
 
@@ -270,7 +291,7 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         let maxAttempts = 2
         for attempt in 1...maxAttempts {
             do {
-                let raw = try await generate(prompt: prompt, maxNewTokens: tokenBudget)
+                let raw = try await generateWithSpeculativeDecoding(prompt: prompt, maxNewTokens: tokenBudget)
                 lastRawOutput = raw
                 let json = try extractJSONObject(from: raw)
                 let payload = try JSONDecoder().decode(SchedulePlanPayload.self, from: Data(json.utf8))
@@ -304,13 +325,20 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
             throw LLMRuntimeError.runnerNotFound(path: runnerScriptPath)
         }
 
+        let powerPolicy = currentPowerPolicy()
+        if powerPolicy.minInterRequestMilliseconds > 0 {
+            await throttleController.enforceMinimumInterval(milliseconds: powerPolicy.minInterRequestMilliseconds)
+        }
+
+        let adjustedMaxTokens = adjustedMaxNewTokens(requestedMaxNewTokens: maxNewTokens, powerPolicy: powerPolicy)
         let request = ONNXRunnerRequest(
             modelPath: modelPath,
             prompt: prompt,
-            maxNewTokens: min(self.maxNewTokens, max(64, maxNewTokens)),
+            maxNewTokens: adjustedMaxTokens,
             temperature: temperature,
             topP: topP,
-            provider: provider
+            provider: provider,
+            cacheKey: promptCacheKey(prompt)
         )
 
         do {
@@ -318,6 +346,31 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
         } catch is ONNXDaemonTransportError {
             return try runOneShot(request: request)
         }
+    }
+
+    private func generateWithSpeculativeDecoding(prompt: String, maxNewTokens: Int) async throws -> String {
+        let normalizedBudget = min(self.maxNewTokens, max(64, maxNewTokens))
+        guard speculativeDecodingEnabled, normalizedBudget >= 192 else {
+            return try await generate(prompt: prompt, maxNewTokens: normalizedBudget)
+        }
+
+        let speculativeBudget = min(
+            normalizedBudget - 1,
+            max(64, Int(Double(normalizedBudget) * speculativeFirstPassRatio))
+        )
+
+        if speculativeBudget >= 64 {
+            do {
+                let speculativeOutput = try await generate(prompt: prompt, maxNewTokens: speculativeBudget)
+                if looksLikeCompleteJSON(speculativeOutput) {
+                    return speculativeOutput
+                }
+            } catch {
+                // If speculative first pass fails, fall back to full-budget generation.
+            }
+        }
+
+        return try await generate(prompt: prompt, maxNewTokens: normalizedBudget)
     }
 
     private func runOneShot(request: ONNXRunnerRequest) throws -> String {
@@ -378,6 +431,53 @@ public struct ONNXGenAILLMRuntime: LLMRuntimeClient {
     private func scheduleTokenBudget(taskCount: Int) -> Int {
         let scaled = max(192, taskCount * 56)
         return min(scheduleMaxNewTokens, max(64, scaled))
+    }
+
+    private struct ONNXPowerPolicy {
+        let minInterRequestMilliseconds: Int
+        let tokenScale: Double
+    }
+
+    private func currentPowerPolicy() -> ONNXPowerPolicy {
+        guard powerAwareThrottlingEnabled else {
+            return ONNXPowerPolicy(minInterRequestMilliseconds: 0, tokenScale: 1.0)
+        }
+
+        if ProcessInfo.processInfo.isLowPowerModeEnabled {
+            return ONNXPowerPolicy(
+                minInterRequestMilliseconds: lowPowerModeMinIntervalMilliseconds,
+                tokenScale: lowPowerModeTokenScale
+            )
+        }
+
+        return ONNXPowerPolicy(minInterRequestMilliseconds: 0, tokenScale: 1.0)
+    }
+
+    private func adjustedMaxNewTokens(requestedMaxNewTokens: Int, powerPolicy: ONNXPowerPolicy) -> Int {
+        let normalized = min(self.maxNewTokens, max(64, requestedMaxNewTokens))
+        let scaled = Int(Double(normalized) * powerPolicy.tokenScale)
+        return min(self.maxNewTokens, max(64, scaled))
+    }
+
+    private func promptCacheKey(_ prompt: String) -> String {
+        let digest = SHA256.hash(data: Data(prompt.utf8))
+        return digest.map { String(format: "%02x", $0) }.joined()
+    }
+
+    private func looksLikeCompleteJSON(_ output: String) -> Bool {
+        if let object = try? extractJSONObject(from: output),
+           let data = object.data(using: .utf8),
+           (try? JSONSerialization.jsonObject(with: data)) != nil {
+            return true
+        }
+
+        if let array = try? extractJSONArray(from: output),
+           let data = array.data(using: .utf8),
+           (try? JSONSerialization.jsonObject(with: data)) != nil {
+            return true
+        }
+
+        return false
     }
 
     private func jsonString(_ value: Any) -> String {
@@ -1634,6 +1734,7 @@ private struct ONNXRunnerRequest: Encodable {
     let temperature: Double
     let topP: Double
     let provider: String?
+    let cacheKey: String?
 
     enum CodingKeys: String, CodingKey {
         case modelPath = "model_path"
@@ -1642,6 +1743,7 @@ private struct ONNXRunnerRequest: Encodable {
         case temperature
         case topP = "top_p"
         case provider
+        case cacheKey = "cache_key"
     }
 }
 
@@ -1650,38 +1752,122 @@ private struct ONNXRunnerResponse: Decodable {
     let error: String?
 }
 
+private struct ONNXRunnerBatchRequest: Encodable {
+    let batch: [ONNXRunnerRequest]
+}
+
+private struct ONNXRunnerBatchResponse: Decodable {
+    let batch: [ONNXRunnerResponse]?
+    let text: String?
+    let error: String?
+}
+
 private struct ONNXDaemonTransportError: Error {
     let message: String
 }
 
+private actor ONNXRequestThrottleController {
+    private var lastRequestAt: Date?
+
+    func enforceMinimumInterval(milliseconds: Int) async {
+        let minIntervalMilliseconds = max(0, milliseconds)
+        guard minIntervalMilliseconds > 0 else {
+            lastRequestAt = Date()
+            return
+        }
+
+        let now = Date()
+        if let lastRequestAt {
+            let elapsedMilliseconds = Int(now.timeIntervalSince(lastRequestAt) * 1000.0)
+            let remainingMilliseconds = minIntervalMilliseconds - elapsedMilliseconds
+            if remainingMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(remainingMilliseconds))
+            }
+        }
+
+        lastRequestAt = Date()
+    }
+}
+
 private actor ONNXRunnerDaemonClient {
+    private struct QueuedRequest {
+        let request: ONNXRunnerRequest
+        let continuation: CheckedContinuation<String, Error>
+    }
+
     private let pythonExecutable: String
     private let runnerScriptPath: String
+    private let batchWindowMilliseconds: Int
+    private let maxBatchSize: Int
     private var process: Process?
     private var stdinHandle: FileHandle?
     private var stdoutHandle: FileHandle?
     private var stdoutBuffer = Data()
+    private var queuedRequests: [QueuedRequest] = []
+    private var flushTask: Task<Void, Never>?
 
-    init(pythonExecutable: String, runnerScriptPath: String) {
+    init(
+        pythonExecutable: String,
+        runnerScriptPath: String,
+        batchWindowMilliseconds: Int = 8,
+        maxBatchSize: Int = 4
+    ) {
         self.pythonExecutable = pythonExecutable
         self.runnerScriptPath = runnerScriptPath
+        self.batchWindowMilliseconds = max(0, batchWindowMilliseconds)
+        self.maxBatchSize = max(1, maxBatchSize)
     }
 
-    func generate(request: ONNXRunnerRequest) throws -> String {
+    func generate(request: ONNXRunnerRequest) async throws -> String {
+        try await withCheckedThrowingContinuation { continuation in
+            queuedRequests.append(QueuedRequest(request: request, continuation: continuation))
+            scheduleFlushIfNeeded()
+        }
+    }
+
+    private func scheduleFlushIfNeeded() {
+        guard flushTask == nil else { return }
+        flushTask = Task {
+            if batchWindowMilliseconds > 0 {
+                try? await Task.sleep(for: .milliseconds(batchWindowMilliseconds))
+            }
+            await flushQueuedRequests()
+        }
+    }
+
+    private func flushQueuedRequests() async {
+        flushTask = nil
+
+        while !queuedRequests.isEmpty {
+            let count = min(maxBatchSize, queuedRequests.count)
+            let chunk = Array(queuedRequests.prefix(count))
+            queuedRequests.removeFirst(count)
+
+            do {
+                let responses = try dispatch(requests: chunk.map(\.request))
+                guard responses.count == chunk.count else {
+                    throw ONNXDaemonTransportError(
+                        message: "Daemon returned \(responses.count) responses for \(chunk.count) requests."
+                    )
+                }
+
+                for (index, item) in chunk.enumerated() {
+                    item.continuation.resume(returning: responses[index])
+                }
+            } catch {
+                for item in chunk {
+                    item.continuation.resume(throwing: error)
+                }
+            }
+        }
+    }
+
+    private func dispatch(requests: [ONNXRunnerRequest]) throws -> [String] {
         do {
             try ensureRunningProcess()
-            try writeRequest(request)
+            try writeRequests(requests)
             let rawResponse = try readResponseData()
-            let response = try JSONDecoder().decode(ONNXRunnerResponse.self, from: rawResponse)
-
-            if let error = response.error {
-                throw LLMRuntimeError.runnerExecutionFailed(code: -1, stderr: error)
-            }
-            guard let text = response.text, !text.isEmpty else {
-                throw ONNXDaemonTransportError(message: "Daemon response did not contain text output.")
-            }
-
-            return text
+            return try decodeResponses(rawResponse: rawResponse, expectedCount: requests.count)
         } catch let error as LLMRuntimeError {
             throw error
         } catch {
@@ -1722,13 +1908,20 @@ private actor ONNXRunnerDaemonClient {
         self.stdoutBuffer.removeAll(keepingCapacity: true)
     }
 
-    private func writeRequest(_ request: ONNXRunnerRequest) throws {
+    private func writeRequests(_ requests: [ONNXRunnerRequest]) throws {
         guard let stdinHandle else {
             throw ONNXDaemonTransportError(message: "Daemon stdin is not available.")
         }
 
         do {
-            var payload = try JSONEncoder().encode(request)
+            let payloadBody: Data
+            if requests.count == 1, let first = requests.first {
+                payloadBody = try JSONEncoder().encode(first)
+            } else {
+                payloadBody = try JSONEncoder().encode(ONNXRunnerBatchRequest(batch: requests))
+            }
+
+            var payload = payloadBody
             payload.append(0x0A)
             try stdinHandle.write(contentsOf: payload)
         } catch {
@@ -1775,7 +1968,65 @@ private actor ONNXRunnerDaemonClient {
         }
     }
 
+    private func decodeResponses(rawResponse: Data, expectedCount: Int) throws -> [String] {
+        if expectedCount <= 1 {
+            if let single = try? JSONDecoder().decode(ONNXRunnerResponse.self, from: rawResponse) {
+                return [try decodeSingleResponse(single)]
+            }
+
+            if let envelope = try? JSONDecoder().decode(ONNXRunnerBatchResponse.self, from: rawResponse) {
+                if let error = envelope.error {
+                    throw LLMRuntimeError.runnerExecutionFailed(code: -1, stderr: error)
+                }
+
+                if let text = envelope.text {
+                    return [text]
+                }
+
+                if let first = envelope.batch?.first {
+                    return [try decodeSingleResponse(first)]
+                }
+            }
+
+            throw ONNXDaemonTransportError(message: "Daemon returned invalid output payload.")
+        }
+
+        let decoded = try JSONDecoder().decode(ONNXRunnerBatchResponse.self, from: rawResponse)
+        if let error = decoded.error {
+            throw LLMRuntimeError.runnerExecutionFailed(code: -1, stderr: error)
+        }
+
+        guard let batch = decoded.batch else {
+            throw ONNXDaemonTransportError(message: "Daemon batch response is missing items.")
+        }
+
+        return try batch.map(decodeSingleResponse)
+    }
+
+    private func decodeSingleResponse(_ response: ONNXRunnerResponse) throws -> String {
+        if let error = response.error {
+            throw LLMRuntimeError.runnerExecutionFailed(code: -1, stderr: error)
+        }
+
+        guard let text = response.text, !text.isEmpty else {
+            throw ONNXDaemonTransportError(message: "Daemon response did not contain text output.")
+        }
+
+        return text
+    }
+
     private func reset() {
+        flushTask?.cancel()
+        flushTask = nil
+
+        if !queuedRequests.isEmpty {
+            let pending = queuedRequests
+            queuedRequests.removeAll(keepingCapacity: false)
+            for item in pending {
+                item.continuation.resume(throwing: ONNXDaemonTransportError(message: "Daemon connection reset."))
+            }
+        }
+
         stdinHandle?.closeFile()
         stdoutHandle?.closeFile()
 

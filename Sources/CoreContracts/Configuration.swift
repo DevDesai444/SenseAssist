@@ -84,6 +84,44 @@ public struct SenseAssistConfiguration: Codable, Equatable, Sendable {
     }
 }
 
+public enum RuntimePathResolver {
+    public static func resolveWritableDatabasePath(preferredPath: String, fallbackBaseDirectory: String) -> String {
+        let preferred = (preferredPath as NSString).expandingTildeInPath
+        if canWriteSQLite(at: preferred) {
+            return preferred
+        }
+
+        let fallback = URL(fileURLWithPath: fallbackBaseDirectory)
+            .appendingPathComponent(".senseassist")
+            .appendingPathComponent("senseassist.sqlite")
+            .path
+
+        if canWriteSQLite(at: fallback) {
+            return fallback
+        }
+
+        // Return the preferred path so the caller still gets a clear open/write failure if no path is writable.
+        return preferred
+    }
+
+    private static func canWriteSQLite(at databasePath: String) -> Bool {
+        let fileURL = URL(fileURLWithPath: databasePath)
+        let directory = fileURL.deletingLastPathComponent()
+
+        do {
+            try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
+        } catch {
+            return false
+        }
+
+        if FileManager.default.fileExists(atPath: databasePath) {
+            return FileManager.default.isWritableFile(atPath: databasePath)
+        }
+
+        return FileManager.default.isWritableFile(atPath: directory.path)
+    }
+}
+
 public enum LogLevel: String, Codable, Comparable, Sendable {
     case debug
     case info

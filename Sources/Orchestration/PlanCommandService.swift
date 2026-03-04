@@ -289,29 +289,65 @@ public actor PlanCommandService {
 
         switch lastOperation {
         case let .createdBlock(blockID, ekEventID):
-            try await calendarStore.deleteManagedBlock(
-                blockID: blockID,
-                ekEventID: ekEventID,
-                calendarName: managedCalendarName
-            )
-            audit("info", "undo_created_block_removed", context: ["revision": "\(currentPlanRevision)"])
-            response = PlanCommandResponse(
-                text: "Undo complete: removed last created block. Plan revision: \(currentPlanRevision)",
-                planRevision: currentPlanRevision
-            )
+            do {
+                try await calendarStore.deleteManagedBlock(
+                    blockID: blockID,
+                    ekEventID: ekEventID,
+                    calendarName: managedCalendarName
+                )
+                audit("info", "undo_created_block_removed", context: ["revision": "\(currentPlanRevision)"])
+                response = PlanCommandResponse(
+                    text: "Undo complete: removed last created block. Plan revision: \(currentPlanRevision)",
+                    planRevision: currentPlanRevision
+                )
+            } catch CalendarStoreError.eventNotFound {
+                // A previously-undone operation may still be marked as applied in storage
+                // if persistence failed earlier. Treat this as idempotent success.
+                audit("warning", "undo_created_block_already_removed", context: ["revision": "\(currentPlanRevision)"])
+                response = PlanCommandResponse(
+                    text: "Undo already applied: block was already removed. Plan revision: \(currentPlanRevision)",
+                    planRevision: currentPlanRevision
+                )
+            }
         case let .movedBlock(previous):
             var reverted = previous
             reverted.planRevision = currentPlanRevision
-            _ = try await calendarStore.updateManagedBlock(reverted, calendarName: managedCalendarName)
-            audit("info", "undo_move_restored", context: ["revision": "\(currentPlanRevision)"])
-            response = PlanCommandResponse(
-                text: "Undo complete: restored previous block timing. Plan revision: \(currentPlanRevision)",
-                planRevision: currentPlanRevision
-            )
+            do {
+                _ = try await calendarStore.updateManagedBlock(reverted, calendarName: managedCalendarName)
+                audit("info", "undo_move_restored", context: ["revision": "\(currentPlanRevision)"])
+                response = PlanCommandResponse(
+                    text: "Undo complete: restored previous block timing. Plan revision: \(currentPlanRevision)",
+                    planRevision: currentPlanRevision
+                )
+            } catch CalendarStoreError.eventNotFound {
+                // Same idempotency principle as created blocks: if the event is gone,
+                // consider the undo applied and continue.
+                audit("warning", "undo_move_target_missing", context: ["revision": "\(currentPlanRevision)"])
+                response = PlanCommandResponse(
+                    text: "Undo already applied: target block no longer exists. Plan revision: \(currentPlanRevision)",
+                    planRevision: currentPlanRevision
+                )
+            }
         }
 
         if let persistedUndoOperationID {
-            try? operationRepository?.markUndone(opID: persistedUndoOperationID)
+            do {
+                try operationRepository?.markUndone(opID: persistedUndoOperationID)
+            } catch {
+                // One immediate retry helps when SQLite was temporarily busy.
+                do {
+                    try operationRepository?.markUndone(opID: persistedUndoOperationID)
+                } catch {
+                    // The calendar was already reverted above. Log the failure so the operation
+                    // is not silently left as 'applied' — which would allow it to be undone again
+                    // on the next restart even though the revert already happened.
+                    audit(
+                        "error",
+                        "mark_undone_failed",
+                        context: ["op_id": persistedUndoOperationID, "error": error.localizedDescription]
+                    )
+                }
+            }
         }
 
         appendRevision(trigger: "slack_undo", summary: PlanSummary(createdBlocks: 0, movedBlocks: 0, deletedBlocks: 1))
@@ -325,7 +361,16 @@ public actor PlanCommandService {
     }
 
     private func audit(_ severity: String, _ message: String, context: [String: String] = [:]) {
-        try? auditLogRepository?.log(category: "slack_plan_command", severity: severity, message: message, context: context)
+        do {
+            try auditLogRepository?.log(category: "slack_plan_command", severity: severity, message: message, context: context)
+        } catch {
+            let contextData = try? JSONEncoder().encode(context)
+            let contextJSON = contextData.flatMap { String(data: $0, encoding: .utf8) } ?? "{}"
+            fputs(
+                "audit_log_failed category=slack_plan_command severity=\(severity) message=\(message) context=\(contextJSON) error=\(error.localizedDescription)\n",
+                stderr
+            )
+        }
     }
 
     private func isoLocal(_ date: Date) -> String {
@@ -340,12 +385,37 @@ public actor PlanCommandService {
             return
         }
 
-        let persistedRevision = max(
-            (try? planRevisionRepository?.latestRevisionID()) ?? 0,
-            (try? operationRepository?.latestAppliedRevision()) ?? 0
-        )
-        currentPlanRevision = max(currentPlanRevision, persistedRevision)
-        hydratedState = true
+        var nextRevision = currentPlanRevision
+        var hadFailure = false
+
+        if let planRevisionRepository {
+            do {
+                nextRevision = max(nextRevision, try planRevisionRepository.latestRevisionID())
+            } catch {
+                hadFailure = true
+                audit(
+                    "error",
+                    "hydrate_revision_failed",
+                    context: ["source": "plan_revisions", "error": error.localizedDescription]
+                )
+            }
+        }
+
+        if let operationRepository {
+            do {
+                nextRevision = max(nextRevision, try operationRepository.latestAppliedRevision())
+            } catch {
+                hadFailure = true
+                audit(
+                    "error",
+                    "hydrate_revision_failed",
+                    context: ["source": "operations", "error": error.localizedDescription]
+                )
+            }
+        }
+
+        currentPlanRevision = nextRevision
+        hydratedState = !hadFailure
     }
 
     private func persistOperation(
@@ -370,11 +440,30 @@ public actor PlanCommandService {
             payloadJSON: payloadJSON,
             resultJSON: resultJSON
         )
-        try? operationRepository.insert(record)
+        do {
+            try operationRepository.insert(record)
+        } catch {
+            // A failed insert means this operation can't be undone after a restart.
+            audit(
+                "error",
+                "persist_operation_failed",
+                context: ["intent": intent, "error": error.localizedDescription]
+            )
+        }
     }
 
     private func appendRevision(trigger: String, summary: PlanSummary) {
-        _ = try? planRevisionRepository?.append(trigger: trigger, summary: summary)
+        do {
+            _ = try planRevisionRepository?.append(trigger: trigger, summary: summary)
+        } catch {
+            // A failed append means the stored revision will lag behind in-memory state.
+            // On restart, hydrateStateIfNeeded will load the last successfully stored revision.
+            audit(
+                "error",
+                "append_revision_failed",
+                context: ["trigger": trigger, "error": error.localizedDescription]
+            )
+        }
     }
 
     private func decodePersistedUndoOperation(from resultJSON: String?) -> UndoOperation? {
