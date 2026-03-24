@@ -1,0 +1,55 @@
+{
+  "time_zone": "America/New_York",
+  "constraints": {
+    "workday_start_hour24": 9,
+    "workday_end_hour24": 22,
+    "avoid_after_hour24": 23,
+    "max_deep_work_minutes_per_day": 240,
+    "break_every_minutes": 90,
+    "break_duration_minutes": 10,
+    "free_space_buffer_minutes": 45
+  },
+  "tasks": [
+    {
+      "title": "CSE331: Project milestone",
+      "category": "project",
+      "due_at_local": "2026-03-10T17:00:00-05:00",
+      "estimated_minutes": 180,
+      "min_daily_minutes": 60,
+      "priority": 5,
+      "stress_weight": 0.4,
+      "status": "todo"
+    },
+    {
+      "title": "Resume: update bullet points",
+      "category": "application",
+      "due_at_local": "2026-03-08T20:00:00-05:00",
+      "estimated_minutes": 90,
+      "min_daily_minutes": 45,
+      "priority": 4,
+      "stress_weight": 0.2,
+      "status": "todo"
+    },
+    {
+      "title": "Term Project RL",
+      "category": "application",
+      "due_at_local": "2026-03-27T23:59:59-05:00",
+      "estimated_minutes": 500,
+      "min_daily_minutes": 60,
+      "priority": 4,
+      "stress_weight": 5,
+      "status": "todo"
+    },
+    {
+      "title": "Quiz prep (short)",
+      "category": "quiz",
+      "due_at_local": "2026-03-08T18:00:00-05:00",
+      "estimated_minutes": 60,
+      "min_daily_minutes": 30,
+      "priority": 4,
+      "stress_weight": 0.3,
+      "status": "todo"
+    }
+  ]
+}
+

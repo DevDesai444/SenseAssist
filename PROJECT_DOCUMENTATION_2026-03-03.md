@@ -1,5 +1,9 @@
 # SenseAssist Project Documentation (March 3, 2026)
 
+Update (March 4, 2026):
+- ONNX runtime now defaults to warm daemon execution so model/tokenizer load is reused across requests.
+- Operation-specific token caps are available for extraction, due-date repair, edit parsing, and schedule planning.
+
 ## 1) Project Summary
 
 SenseAssist is a local-first macOS assistant that ingests Gmail/Outlook updates, extracts tasks, builds feasible daily plans with an on-device LLM, and applies managed calendar mutations with auditability.
@@ -27,8 +31,8 @@ Core properties:
 ## 3) Runtime Flow (High-Level)
 
 1. Ingestion services pull Gmail/Outlook updates with per-account cursors.
-2. Parser + LLM extraction converts updates to normalized `TaskItem`s.
-3. Auto-planning builds `planner_input.json` snapshot and requests LLM schedule JSON.
+2. Parser + rule validation + intent triage narrow candidates before LLM extraction converts updates to normalized `TaskItem`s.
+3. Auto-planning builds `planner_input.json` snapshot and requests LLM schedule JSON through the warm ONNX daemon path.
 4. Schedule output is validated (constraints/overlaps/time windows).
 5. EventKit adapter applies managed calendar mutations.
 6. Operation history is stored for audit and future rollback/undo.
@@ -40,6 +44,8 @@ Model profile: `Models/Phi-3.5-mini-instruct-onnx/cpu_and_mobile/cpu-int4-awq-bl
 Runner: `Scripts/onnx_genai_runner.py`  
 Suite: `standard` (`3` measured + `1` warmup per case)  
 Measured runs: `9`
+
+Important: this benchmark is a one-shot runner baseline (pre-daemon optimization). Re-run benchmarks after enabling the updated runtime to compare setup-latency improvements.
 
 ### 4.1 Core Results (Overall)
 
@@ -69,6 +75,22 @@ Measured runs: `9`
 - Markdown report: `Docs/ON_DEVICE_MODEL_BENCHMARK.md`
 - Raw JSON: `Docs/ON_DEVICE_MODEL_BENCHMARK.json`
 
+### 4.4 Runtime Optimization Status (March 4, 2026)
+
+- Warm model reuse:
+  - `Scripts/onnx_genai_runner.py` supports `--daemon` mode and keeps model/tokenizer loaded across requests.
+  - `Sources/LLMRuntime/LLMRuntime.swift` uses daemon mode first and falls back to one-shot execution only on daemon transport failure.
+- Token-budget control:
+  - Per-intent max token budgets are enforced in runtime:
+    - extraction
+    - due-date repair
+    - Slack edit parsing
+    - day schedule planning
+- Existing optimization guardrails:
+  - extraction candidates are triaged before LLM calls
+  - scheduler input is confidence-gated
+  - retry count remains bounded (`maxAttempts = 2`)
+
 ## 5) How To Re-run Benchmark
 
 ```bash
@@ -87,3 +109,19 @@ bash Scripts/benchmark_phi35_instruct_onnx.sh \
   --output-json Docs/ON_DEVICE_MODEL_BENCHMARK.json \
   --output-markdown Docs/ON_DEVICE_MODEL_BENCHMARK.md
 ```
+
+## 6) ONNX Runtime Tuning Env Vars
+
+- Core:
+  - `SENSEASSIST_ONNX_MODEL_PATH`
+  - `SENSEASSIST_ONNX_RUNNER`
+  - `SENSEASSIST_ONNX_PYTHON`
+  - `SENSEASSIST_ONNX_PROVIDER`
+  - `SENSEASSIST_ONNX_MAX_NEW_TOKENS`
+  - `SENSEASSIST_ONNX_TEMPERATURE`
+  - `SENSEASSIST_ONNX_TOP_P`
+- Optional per-intent caps:
+  - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_EXTRACT`
+  - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_DUE_REPAIR`
+  - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_EDIT`
+  - `SENSEASSIST_ONNX_MAX_NEW_TOKENS_SCHEDULE`

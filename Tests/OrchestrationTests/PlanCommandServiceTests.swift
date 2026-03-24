@@ -69,6 +69,23 @@ actor DeniedCalendarStore: CalendarStore {
     #expect(command == .undo)
 }
 
+@Test func parserParsesMoveCommandWithExplicitMatchSelection() throws {
+    var calendar = Calendar(identifier: .gregorian)
+    calendar.timeZone = TimeZone(secondsFromGMT: -5 * 3600)!
+
+    let now = Date(timeIntervalSince1970: 1_709_251_200)
+    let command = try PlanCommandParser.parse("move \"Homework\" #2 tomorrow 7:00pm 90m", now: now, calendar: calendar)
+
+    guard case let .move(title, selectedMatchIndex, _, durationMinutes) = command else {
+        Issue.record("Expected move command with explicit selection")
+        return
+    }
+
+    #expect(title == "Homework")
+    #expect(selectedMatchIndex == 2)
+    #expect(durationMinutes == 90)
+}
+
 @Test func planServiceAddAndTodayFlow() async {
     let store = InMemoryCalendarStore()
     let service = PlanCommandService(calendarStore: store, initialPlanRevision: 10)
@@ -94,6 +111,7 @@ actor DeniedCalendarStore: CalendarStore {
 
     #expect(moveResponse.requiresConfirmation)
     #expect(moveResponse.text.contains("Ambiguous match"))
+    #expect(moveResponse.text.contains("#2"))
 }
 
 @Test func planServiceMoveUpdatesSingleMatch() async {
@@ -107,6 +125,34 @@ actor DeniedCalendarStore: CalendarStore {
     #expect(!moveResponse.requiresConfirmation)
     #expect(moveResponse.text.contains("Moved"))
     #expect(moveResponse.planRevision == 32)
+}
+
+@Test func planServiceMoveUsesExplicitMatchSelection() async throws {
+    let store = InMemoryCalendarStore()
+    let service = PlanCommandService(calendarStore: store, initialPlanRevision: 50)
+
+    _ = await service.handle(commandText: "add \"Homework\" 60m today 5:00pm")
+    _ = await service.handle(commandText: "add \"Homework\" 45m today 8:00pm")
+
+    let moveResponse = await service.handle(commandText: "move \"Homework\" #2 tomorrow 7:30pm 90m")
+
+    #expect(!moveResponse.requiresConfirmation)
+    #expect(moveResponse.text.contains("Moved"))
+    #expect(moveResponse.planRevision == 53)
+
+    let blocksTomorrow = try await store.findManagedBlocks(
+        fuzzyTitle: "Homework",
+        on: nil,
+        calendar: .current
+    )
+
+    let movedBlock = blocksTomorrow.first { block in
+        let hour = Calendar.current.component(.hour, from: block.startLocal)
+        let minute = Calendar.current.component(.minute, from: block.startLocal)
+        return hour == 19 && minute == 30
+    }
+
+    #expect(movedBlock?.title == "Deep Work: Homework")
 }
 
 @Test func planServiceReturnsPermissionRemediation() async {

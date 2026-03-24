@@ -72,13 +72,18 @@ public actor PlanCommandService {
                 return try await handleToday(now: now)
             case let .add(title, start, durationMinutes):
                 return try await handleAdd(title: title, start: start, durationMinutes: durationMinutes)
-            case let .move(title, start, durationMinutes):
-                return try await handleMove(title: title, start: start, durationMinutes: durationMinutes)
+            case let .move(title, selectedMatchIndex, start, durationMinutes):
+                return try await handleMove(
+                    title: title,
+                    selectedMatchIndex: selectedMatchIndex,
+                    start: start,
+                    durationMinutes: durationMinutes
+                )
             case .undo:
                 return try await handleUndo()
             case .help:
                 return PlanCommandResponse(
-                    text: "Supported: /plan today, /plan add \"Title\" 60m [today|tomorrow] [7:00pm], /plan move \"Title\" tomorrow 7:00pm [60m], /plan undo",
+                    text: "Supported: /plan today, /plan add \"Title\" 60m [today|tomorrow] [7:00pm], /plan move \"Title\" [#2] tomorrow 7:00pm [60m], /plan undo",
                     planRevision: currentPlanRevision
                 )
             }
@@ -185,7 +190,12 @@ public actor PlanCommandService {
         }
     }
 
-    private func handleMove(title: String, start: Date, durationMinutes: Int?) async throws -> PlanCommandResponse {
+    private func handleMove(
+        title: String,
+        selectedMatchIndex: Int?,
+        start: Date,
+        durationMinutes: Int?
+    ) async throws -> PlanCommandResponse {
         let matches = try await calendarStore.findManagedBlocks(fuzzyTitle: title, on: nil, calendar: calendar)
 
         if matches.isEmpty {
@@ -193,21 +203,46 @@ public actor PlanCommandService {
             return PlanCommandResponse(text: "No matching managed block found for \"\(title)\".", planRevision: currentPlanRevision)
         }
 
-        if matches.count > 1 {
+        if let selectedMatchIndex {
+            guard selectedMatchIndex > 0 else {
+                audit("warning", "move_invalid_selection", context: ["title": title, "selection": "\(selectedMatchIndex)"])
+                return PlanCommandResponse(
+                    text: "Invalid selection for \"\(title)\". Use a positive match number like `/plan move \"\(title)\" #2 tomorrow 7:00pm`.",
+                    planRevision: currentPlanRevision
+                )
+            }
+        }
+
+        if matches.count > 1 && selectedMatchIndex == nil {
             let options = matches.enumerated().map { index, block in
                 "\(index + 1). \(block.title) @ \(isoLocal(block.startLocal))"
             }.joined(separator: "\n")
 
             return PlanCommandResponse(
-                text: "Ambiguous match for \"\(title)\". Choose one:\n\(options)",
+                text: "Ambiguous match for \"\(title)\". Choose one by retrying with `#N`, for example `/plan move \"\(title)\" #2 tomorrow 7:00pm`.\n\(options)",
                 planRevision: currentPlanRevision,
                 requiresConfirmation: true
             )
         }
 
-        guard var target = matches.first else {
-            return PlanCommandResponse(text: "No matching managed block found for \"\(title)\".", planRevision: currentPlanRevision)
+        let resolvedMatchIndex = (selectedMatchIndex ?? 1) - 1
+        guard resolvedMatchIndex >= 0, resolvedMatchIndex < matches.count else {
+            audit(
+                "warning",
+                "move_selection_out_of_range",
+                context: [
+                    "title": title,
+                    "selection": "\(selectedMatchIndex ?? 0)",
+                    "match_count": "\(matches.count)"
+                ]
+            )
+            return PlanCommandResponse(
+                text: "Selection #\(selectedMatchIndex ?? 0) is out of range for \"\(title)\". Available matches: 1-\(matches.count).",
+                planRevision: currentPlanRevision
+            )
         }
+
+        var target = matches[resolvedMatchIndex]
 
         let oldDuration = Int(target.endLocal.timeIntervalSince(target.startLocal) / 60)
         let newDuration = durationMinutes ?? max(30, oldDuration)
@@ -224,7 +259,7 @@ public actor PlanCommandService {
 
         let decision = RulesEngine.validate(
             editOperation: operation,
-            context: EditValidationContext(currentPlanRevision: currentPlanRevision, matchedTargetCount: matches.count)
+            context: EditValidationContext(currentPlanRevision: currentPlanRevision, matchedTargetCount: 1)
         )
 
         switch decision {
